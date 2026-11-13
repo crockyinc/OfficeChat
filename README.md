@@ -14,7 +14,7 @@ npm test
 npm run build
 ```
 
-The development command runs Vite and an in-memory Node/WebSocket signaling adapter. Open two tabs or devices, keep both online and send a message. Same-network detection uses the IP supplied by the local proxy. For a production-like Worker, run `npm run worker:dev` separately; configure the frontend with `VITE_SIGNAL_URL` pointing at that Worker (see below). This Node adapter is for development, not a hardened public deployment.
+The development command runs Vite and an in-memory Node/WebSocket signaling adapter. Open two tabs or devices, keep both online and send a message. Same-network detection uses the IP supplied by the local proxy. For a production-like Worker, run `npm run worker:dev` separately (Wrangler builds the static assets first); configure the frontend with `VITE_SIGNAL_URL` pointing at that Worker (see below). This Node adapter is for development, not a hardened public deployment.
 
 WebRTC, Web Crypto, clipboard, service workers, and camera-independent QR viewing require a **secure context**: use HTTPS on real devices. `localhost` is normally treated as secure, but plain HTTP on a LAN address usually is not. A proxy/HTTPS tunnel or production deployment is needed to test with a phone. On the same network, both devices must use the same public-facing site and signaling service.
 
@@ -28,18 +28,25 @@ WebRTC, Web Crypto, clipboard, service workers, and camera-independent QR viewin
 
 ## Deployment
 
-### 1. Deploy signaling
+### Deploy the app and signaling together on Cloudflare Workers
+
+The Worker serves the built frontend at its root and handles `/signal`, `/config`, and `/health` on the same origin. Static assets contain only the public app shell, never chat data. From a local checkout:
 
 ```sh
+npm ci
 npx wrangler login
 npx wrangler deploy
 ```
 
-`wrangler.toml` binds one Durable Object class. The SQLite-class migration is required by Cloudflare to provision the class; the application **never calls Durable Object storage** and has no D1, R2, KV, or other storage bindings. All rooms and sockets are in memory. Room membership is deleted when the room empties; a restart loses all state, and clients reconnect. The single live Durable Object is intentionally simple and may need a different routing design for large deployments.
+`wrangler.toml` runs `npm run build` automatically before deployment and uploads the generated `dist/` assets. Open the resulting `https://<worker>.<subdomain>.workers.dev/` URL to use the app. Set the Worker name in `wrangler.toml`, or use `npx wrangler deploy --name chat` to update an existing Worker named `chat` rather than creating a different Worker.
+
+For a Git-connected Worker build in the Cloudflare dashboard, use **Build command** `npm ci && npm run build` and **Deploy command** `npx wrangler deploy`. The Wrangler custom build also runs during deploy; the extra build is harmless. Confirm the deployment targets your existing Worker and redeploy the latest commit. If the Worker still displays “ChatByWiFi signaling service,” it is running the old signaling-only deployment.
+
+`wrangler.toml` binds one Durable Object class. The SQLite-class migration is required by Cloudflare to provision the class; the application **never calls Durable Object storage** and has no D1, R2, KV, or other user-data storage bindings. All rooms and sockets are in memory. Room membership is deleted when the room empties; a restart loses all state, and clients reconnect. The single live Durable Object is intentionally simple and may need a different routing design for large deployments.
 
 Optional TURN configuration can be supplied as Worker variables or secrets (`TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL`); for the local Node adapter they are environment variables. `TURN_URLS` is a single URL, e.g. `turn:turn.example.com:3478`. `/config` publishes these values to every client, **including the credential**: do not use privileged long-lived credentials. Use restricted or short-lived credentials and account for TURN bandwidth costs. ICE may select TURN when configured; TURN relays WebRTC's DTLS-encrypted traffic, not plaintext messages. This project does not provide a TURN server.
 
-### 2. Deploy static frontend
+### Alternative: host frontend separately
 
 Set the Worker origin at **build time**, then build and deploy `dist/` to Cloudflare Pages or another HTTPS static host:
 
@@ -48,7 +55,7 @@ VITE_SIGNAL_URL=https://YOUR-WORKER.workers.dev npm run build
 # deploy dist/ with your preferred static host / Pages
 ```
 
-The Worker supplies CORS for `/config`; WebSocket connections use its `/signal` endpoint. The configured signaling origin must accept WebSocket upgrades. A same-origin reverse proxy exposing `/config` and `/signal` also works; in that case omit `VITE_SIGNAL_URL`. Route `/r/<id>` to `index.html` for direct links (the included `_redirects` covers Cloudflare Pages). Make sure HTTPS and secure WebSockets are enabled. Never put a private PIN in the URL.
+The Worker supplies CORS for `/config`; WebSocket connections use its `/signal` endpoint. The configured signaling origin must accept WebSocket upgrades. A same-origin reverse proxy exposing `/config` and `/signal` also works; in that case omit `VITE_SIGNAL_URL`. Configure your static host to serve `index.html` for `/r/<id>`; Cloudflare Workers' single-page-application fallback handles this automatically. Make sure HTTPS and secure WebSockets are enabled. Never put a private PIN in the URL.
 
 The included CSP forbids inline scripts and external scripts. `connect-src` permits HTTPS/WebSocket origins to allow configurable signaling; for a fixed production deployment restrict it to `'self'` and your exact signaling origin. Configure server-side security headers as appropriate. The service worker caches the built app shell for offline launch, but chat and room discovery require network connectivity and other peers.
 

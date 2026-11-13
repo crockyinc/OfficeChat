@@ -1,4 +1,4 @@
-# ChatByWiFi signaling Worker.
+# ChatByWiFi app and signaling Worker.
 #
 # Deliberately NO database or object-storage bindings:
 # no D1, no R2, no KV, no Queues. The Durable Object below is only a
@@ -8,6 +8,17 @@
 name = 'chat'
 main = "worker/src/index.js"
 compatibility_date = "2025-01-01"
+
+# Build the public app shell before every deploy (including Git builds).
+[build]
+command = "npm run build"
+
+# Static application files only; never user messages, images, or profiles.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/signal", "/config", "/health"]
 
 [observability]
 enabled = true
