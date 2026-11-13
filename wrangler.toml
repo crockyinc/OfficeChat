@@ -5,6 +5,7 @@
 # live meeting point — it holds room membership in memory and forgets
 # everything when a room empties or the isolate restarts.
 
+# wrangler.toml
 name = 'chat'
 main = "worker/src/index.js"
 compatibility_date = "2025-01-01"
