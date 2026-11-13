@@ -2,12 +2,13 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'vite';
 import { SignalingCore } from '../worker/src/core.js';
+import { DEFAULT_ICE_SERVERS } from '../frontend/js/ice.js';
 
 const core = new SignalingCore();
 const sockets = new Map();
 const server = http.createServer((req, res) => {
   if (req.url === '/config') {
-    const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    const iceServers = [...DEFAULT_ICE_SERVERS];
     if (process.env.TURN_URLS) iceServers.push({ urls: process.env.TURN_URLS, username: process.env.TURN_USERNAME || '', credential: process.env.TURN_CREDENTIAL || '' });
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify({ iceServers }));
   } else { res.writeHead(404); res.end(); }

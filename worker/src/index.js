@@ -12,6 +12,7 @@
 //   - Message payloads are never logged. Logs contain only counts.
 
 import { SignalingCore, deriveNetworkRoomId } from './core.js';
+import { DEFAULT_ICE_SERVERS } from '../../frontend/js/ice.js';
 
 export class SignalingRoom {
   constructor() {
@@ -84,7 +85,7 @@ export default {
     // only — it cannot read message contents.
     if (url.pathname === '/config') {
       const config = {
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        iceServers: [...DEFAULT_ICE_SERVERS],
       };
       if (env.TURN_URLS) {
         config.iceServers.push({

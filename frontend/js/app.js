@@ -1,4 +1,7 @@
 import QRCode from 'qrcode';
+import { LocalTabs } from './local-tabs.js';
+import { PeerRecovery } from './peer-recovery.js';
+import { DEFAULT_ICE_SERVERS } from './ice.js';
 import { browserProfile, roomIdentity, distinctPeople, isOwnPeer } from './profile.js';
 import { createInvitation, isPrivateInvitation, isValidInvitePin } from './invitations.js';
 import { derivePinKey, seal, unseal, generateRoomId, randomPeerId } from './crypto.js';
@@ -17,9 +20,14 @@ let presenceReady = Promise.resolve();
 let original = localStorage.getItem('cbw-original') === 'true';
 let roomId = location.pathname.match(/^\/r\/([A-Za-z0-9_-]{22})\/?$/)?.[1] || null;
 const peerId = randomPeerId();
-let key = null, ws, permanentlyClosed = false, terminalStatus = 'Room is full', iceServers = [{urls:'stun:stun.l.google.com:19302'}], retry = 0, retryTimer, joined = false;
+let key = null, ws, permanentlyClosed = false, terminalStatus = 'Room is full', iceServers = [...DEFAULT_ICE_SERVERS], retry = 0, retryTimer, joined = false;
+let recoveryAttempts = 0;
 const peers = new Map(), messages = new Map(), incoming = new ImageReceiver(), transfers = new Map();
 const pendingInvitations = new Map(), seenInvitations = new Set();
+let localChannel = null;
+try { if ('BroadcastChannel' in window) localChannel = new BroadcastChannel('chatbywifi-local-tabs-v1'); } catch {}
+const localTabs = new LocalTabs(peerId, localChannel, id => { if (peers.has(id)) removePeer(id, false); });
+window.addEventListener('pagehide', event => { if (!event.persisted) localTabs.close(); });
 const signalBase = (import.meta.env.VITE_SIGNAL_URL || '').replace(/\/$/, '');
 const signalURL = (path) => new URL(signalBase + path, location.origin);
 const escapeText = (text) => document.createTextNode(text);
@@ -31,7 +39,12 @@ function toast(text) { $('#toast').textContent = text; $('#toast').classList.add
 function personRow(displayName, avatarColor, detail, peer) {
   const row=document.createElement(peer ? 'button' : 'div');
   row.className='person-row';
-  if(peer) { row.type='button'; row.disabled=!peer.open; row.onclick=()=>startPrivateInvite(peer.id); }
+  if(peer) {
+    row.type='button';
+    const canRetry = !peer.open && ['failed','closed'].includes(peer.pc.connectionState);
+    row.disabled=!peer.open && !canRetry;
+    row.onclick=()=>canRetry ? reconnectMesh() : startPrivateInvite(peer.id);
+  }
   const avatar=document.createElement('span'); avatar.className=`person-avatar${!peer || peer.open ? ' online' : ''}`;
   avatar.textContent=displayName.slice(0,1).toUpperCase() || '?';
   if(avatarColor) avatar.style.backgroundColor=avatarColor;
@@ -39,14 +52,14 @@ function personRow(displayName, avatarColor, detail, peer) {
   const title=document.createElement('strong'); title.textContent=displayName;
   const subtitle=document.createElement('small'); subtitle.textContent=detail;
   details.append(title,subtitle); row.append(avatar,details);
-  if(peer?.open) { const action=document.createElement('span'); action.className='person-action'; action.textContent='Invite'; row.append(action); row.setAttribute('aria-label',`Invite ${displayName} to a private chat`); }
+  if(peer?.open || peer && ['failed','closed'].includes(peer.pc.connectionState)) { const action=document.createElement('span'); action.className='person-action'; action.textContent=peer.open?'Invite':'Retry'; row.append(action); row.setAttribute('aria-label',peer.open?`Invite ${displayName} to a private chat`:'Retry connection'); }
   return row;
 }
 function renderPeople(target) {
   target.replaceChildren();
   target.append(personRow(name,color,'You',null));
   const others=distinctPeople(peers.values(),presenceId);
-  for(const peer of others) target.append(personRow(peer.name,peer.color,peer.open?'Online · Tap to invite':peer.pc.connectionState==='failed'?'Connection failed · check NAT/TURN':'Connecting…',peer));
+  for(const peer of others) target.append(personRow(peer.name,peer.color,peer.open?'Online · Tap to invite':['failed','closed'].includes(peer.pc.connectionState)?'Connection failed · tap Retry':'Connecting…',peer));
   if(!others.length) { const empty=document.createElement('p');empty.className='people-empty';empty.textContent=joined?'No one else is here yet. Use the same connection and disable VPNs, or invite via a private room.':'Looking for people…';target.append(empty); }
 }
 function refreshPeople() {
@@ -147,28 +160,63 @@ $('#jump').onclick=()=>scrollBottom(true);
 function time(ts) { return new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 function addText(text, mine, sender, id, ts = Date.now()) { const wrap=document.createElement('div'); wrap.className=`message ${mine?'out':'in'}`; if(!mine) { const n=document.createElement('div'); n.className='sender'; n.textContent=sender; wrap.append(n); } const p=document.createElement('p'); const parts=String(text).split(/(https?:\/\/[^\s<>]+)/g); for(const part of parts) { if(/^https?:\/\//i.test(part)) { try { const u=new URL(part); if(['http:','https:'].includes(u.protocol)) { const a=document.createElement('a'); a.href=u.href; a.target='_blank'; a.rel='noopener noreferrer'; a.textContent=part; p.append(a); continue; } } catch {} } p.append(escapeText(part)); } wrap.append(p); const meta=document.createElement('div'); meta.className='message-meta'; const copy=button('⧉','',()=>navigator.clipboard.writeText(text).then(()=>toast('Message copied')).catch(()=>toast('Could not copy message'))); copy.title='Copy message'; const stamp=document.createElement('span'); stamp.textContent=time(ts); meta.append(copy,stamp); if(mine) { const ticks=document.createElement('span'); ticks.className='ticks'; ticks.textContent='◷'; meta.append(ticks); } wrap.append(meta); $('#welcome').hidden=true; $('#messages').append(wrap); messages.set(id,wrap); scrollBottom(mine); return wrap; }
 function setState(id,state) { const ticks=messages.get(id)?.querySelector('.ticks'); if(ticks) {if(ticks.title==='delivered' && state==='sent') return; ticks.textContent=state==='delivered'?'✓✓':state==='sent'?'✓':'◷'; ticks.title=state;} }
-function sendSignal(to, data) { if(ws?.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({type:'signal',to,data})); }
+function sendSignal(to, data) { if(ws?.readyState !== WebSocket.OPEN) throw new Error('Signaling is disconnected'); ws.send(JSON.stringify({type:'signal',to,data})); }
 async function signal(to, type, value) { let data={type,value}; if(key) { const encrypted=await seal(key,data); data={type:'encrypted',iv:encrypted.iv,data:encrypted.data}; } sendSignal(to,data); }
 function hasOtherOpenTab(p) { return !!p.identity && [...peers.values()].some(other => other !== p && other.open && other.identity === p.identity); }
-function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; const notify=announce && p.open && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); peers.delete(id); for (const pending of pendingInvitations.values()) pending.fail(id); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(notify) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
+function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; p.recovery?.close(); const notify=announce && p.open && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); peers.delete(id); for (const pending of pendingInvitations.values()) pending.fail(id); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(notify) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
 async function connectionType(p) { try { const stats=await p.pc.getStats(); for (const s of stats.values()) if(s.type==='transport' && s.selectedCandidatePairId) { const pair=stats.get(s.selectedCandidatePairId), local=stats.get(pair?.localCandidateId), remote=stats.get(pair?.remoteCandidateId); status(local?.candidateType==='relay'||remote?.candidateType==='relay'?'Connected via relay':'Connected directly'); return; } } catch {} status('Connected'); }
+function reconnectMesh() {
+  if(ws?.readyState===WebSocket.OPEN) { recoveryAttempts++; status('Reconnecting to peers…'); ws.close(4001,'Retry peer connections'); }
+}
 function makePeer(id, initiator) {
+  if(localTabs.has(id)) return null;
   if(peers.has(id)) return peers.get(id);
   const pc=new RTCPeerConnection({iceServers}); const p={id,pc,name:'Someone',color:null,identity:null,open:false,dc:null,queue:Promise.resolve(),receiveQueue:Promise.resolve(), signalQueue:Promise.resolve(), candidates:[]}; peers.set(id,p); count();
   pc.onicecandidate=e=>{if(e.candidate) signal(id,'ice',e.candidate.toJSON()).catch(()=>{});};
-  pc.onconnectionstatechange=()=>{ if(pc.connectionState==='connected') connectionType(p); if(pc.connectionState==='failed') { status('Connection failed · check NAT/TURN'); count(); if(initiator) pc.restartIce(); } if(pc.connectionState==='disconnected') status('Connection interrupted…'); };
-  pc.onnegotiationneeded=async()=>{ if(!initiator)return; try { await pc.setLocalDescription(await pc.createOffer()); await signal(id,'offer',pc.localDescription.toJSON()); } catch { status('Connection failed'); } };
-  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ presenceReady.then(()=>sendTo(p,{t:'hello',name,color,identity:presenceId})).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {for(const pending of pendingInvitations.values()) pending.fail(id);const notify=!isOwnPeer(p,presenceId) && !hasOtherOpenTab(p);p.open=false; if(notify) system(`${p.name} disconnected`); count(); if(notify) status('Peer left');} }; };
+  p.recovery=new PeerRecovery({
+    isCurrent:()=>peers.get(id)===p,
+    isHealthy:()=>pc.connectionState==='connected' && p.open,
+    restartIce:()=>{if(initiator) pc.restartIce();},
+    reconnect:reconnectMesh,
+    onRetry:()=>{status('Connection interrupted · retrying…');count();},
+    delay:()=>Math.min(60000,8000 * 2 ** Math.min(recoveryAttempts,3)) + Math.floor(Math.random()*1500),
+  });
+  p.recovery.watch();
+  pc.onconnectionstatechange=()=>{
+    if(pc.connectionState==='connected') { connectionType(p); if(p.open) p.recovery.ready(); }
+    if(pc.connectionState==='failed' || pc.connectionState==='closed') { count(); p.recovery.failed(); }
+    if(pc.connectionState==='disconnected') { status('Connection interrupted…'); p.recovery.watch(); }
+  };
+  pc.onnegotiationneeded=async()=>{ if(!initiator)return; try { await pc.setLocalDescription(await pc.createOffer()); await signal(id,'offer',pc.localDescription.toJSON()); } catch { status('Connection interrupted · retrying…'); p.recovery.failed(); } };
+  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ presenceReady.then(()=>sendTo(p,{t:'hello',name,color,identity:presenceId})).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {for(const pending of pendingInvitations.values()) pending.fail(id);const notify=!isOwnPeer(p,presenceId) && !hasOtherOpenTab(p);p.open=false; if(notify) system(`${p.name} disconnected`); count(); if(notify) {status('Connection interrupted · retrying…');p.recovery.failed();}} }; };
   if(initiator) attach(pc.createDataChannel('chat', {ordered:true})); else pc.ondatachannel=e=>attach(e.channel);
   return p;
 }
-async function handleSignal(from, data) { const p=peers.get(from) || makePeer(from,false); p.signalQueue=p.signalQueue.then(async()=>{ if(data.type==='encrypted') data=await unseal(key,{enc:1,iv:data.iv,data:data.data}); else if(key) throw Error('pin mismatch'); if(!data || !['offer','answer','ice'].includes(data.type)) return; if(data.type==='ice') { if(p.pc.remoteDescription) await p.pc.addIceCandidate(data.value); else p.candidates.push(data.value); } else { await p.pc.setRemoteDescription(data.value); for(const candidate of p.candidates.splice(0)) await p.pc.addIceCandidate(candidate); if(data.type==='offer') { await p.pc.setLocalDescription(await p.pc.createAnswer()); await signal(from,'answer',p.pc.localDescription.toJSON()); } } }).catch(()=>{ toast('Could not connect. Check that both devices use the same PIN.'); removePeer(from,false); }); }
+async function handleSignal(from, data) {
+  if(localTabs.has(from)) return;
+  const p=peers.get(from) || makePeer(from,false); if(!p) return;
+  p.signalQueue=p.signalQueue.then(async()=>{
+    if(data.type==='encrypted') {
+      try { data=await unseal(key,{enc:1,iv:data.iv,data:data.data}); }
+      catch { toast('Could not verify peer. Check that both devices use the same PIN.'); removePeer(from,false); return; }
+    } else if(key) { toast('Could not verify peer. Check that both devices use the same PIN.'); removePeer(from,false); return; }
+    if(!data || !['offer','answer','ice'].includes(data.type)) return;
+    if(data.type==='ice') {
+      if(p.pc.remoteDescription) { try { await p.pc.addIceCandidate(data.value); } catch { /* stale/invalid candidates must not tear down a connection */ } }
+      else p.candidates.push(data.value);
+    } else {
+      await p.pc.setRemoteDescription(data.value);
+      for(const candidate of p.candidates.splice(0)) { try { await p.pc.addIceCandidate(candidate); } catch { /* ignore stale candidates */ } }
+      if(data.type==='offer') { await p.pc.setLocalDescription(await p.pc.createAnswer()); await signal(from,'answer',p.pc.localDescription.toJSON()); }
+    }
+  }).catch(()=>{ if(peers.get(from)===p) { status('Connection interrupted · retrying…'); p.recovery.failed(); } });
+}
 function sendTo(p, payload) { p.queue=p.queue.then(async()=>{ if(!p.dc || p.dc.readyState!=='open') throw Error('closed'); const wire=await seal(key,payload); p.dc.send(JSON.stringify(wire)); }); return p.queue; }
 function broadcast(payload) { return Promise.allSettled([...peers.values()].filter(p=>p.open && (payload.t==='hello' || !isOwnPeer(p,presenceId))).map(p=>sendTo(p,payload))); }
 async function receive(p, raw) {
   if(typeof raw!=='string' || raw.length>50000) throw Error('invalid message');
   const msg=await unseal(key,JSON.parse(raw)); if(!msg || typeof msg.t!=='string') return;
-  if(msg.t==='hello') { if(typeof msg.name!=='string')return; await presenceReady; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.color=typeof msg.color==='string' && /^#[0-9a-fA-F]{6}$/.test(msg.color) ? msg.color : null; p.identity=typeof msg.identity==='string' && /^[0-9a-f]{64}$/.test(msg.identity) ? msg.identity : null; const notify=first && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); p.open=true; count(); if(notify) system(`${p.name} joined the room`); if(!isOwnPeer(p,presenceId)) connectionType(p); return; }
+  if(msg.t==='hello') { if(typeof msg.name!=='string')return; await presenceReady; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.color=typeof msg.color==='string' && /^#[0-9a-fA-F]{6}$/.test(msg.color) ? msg.color : null; p.identity=typeof msg.identity==='string' && /^[0-9a-f]{64}$/.test(msg.identity) ? msg.identity : null; const notify=first && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); p.open=true; p.recovery.ready(); if([...peers.values()].every(other=>other.open)) recoveryAttempts=0; count(); if(notify) system(`${p.name} joined the room`); if(!isOwnPeer(p,presenceId)) connectionType(p); return; }
   if(!p.open) return;
   if(!roomId && isPrivateInvitation(msg)) {
     const seenKey = `${p.id}:${msg.id}`;
@@ -190,7 +238,7 @@ async function receive(p, raw) {
   } else if(msg.t==='img-cancel' && typeof msg.id==='string') { const id=`${p.id}:${msg.id}`; incoming.cancel(id); const el=document.querySelector(`[data-transfer-id="${CSS.escape(id)}"]`); if(el) el.querySelector('.image-loading').textContent='Transfer cancelled'; }
 }
 async function connect() {
-  try { const r=await fetch(signalURL('/config')); if(r.ok) iceServers=(await r.json()).iceServers; } catch {}
+  try { const r=await fetch(signalURL('/config')); if(r.ok) { const config=await r.json(); if(Array.isArray(config.iceServers) && config.iceServers.length) iceServers=config.iceServers; } } catch {}
   if(roomId) { const pin=sessionStorage.getItem(`cbw-pin:${roomId}`); if(pin) key=await derivePinKey(pin,roomId); }
   openSocket();
 }
