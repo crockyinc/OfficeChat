@@ -1,0 +1,6 @@
+{
+  "name": "chatbywifi", "version": "1.0.0", "private": true, "type": "module",
+  "scripts": {"dev": "node dev/server.mjs", "build": "vite build", "test": "node --test tests/*.test.js", "worker:dev": "wrangler dev"},
+  "dependencies": {"qrcode": "^1.5.4", "ws": "^8.18.0"},
+  "devDependencies": {"vite": "^6.1.0", "wrangler": "^4.0.0"}
+}

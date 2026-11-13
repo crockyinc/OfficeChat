@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#f8faf8"><meta name="description" content="A little room for the people on your Wi-Fi. No account, no cloud history.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https: wss: ws:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg" type="image/svg+xml"><title>ChatByWiFi — Your space, together</title>
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-icon"><svg viewBox="0 0 24 24"><path d="M5 10a11 11 0 0 1 14 0M8 13a6.5 6.5 0 0 1 8 0M11 16a2 2 0 0 1 2 0"/><path d="M4 18v-3a8 8 0 1 1 16 0v3a2 2 0 0 1-2 2H8l-4 2z"/></svg></div><div><strong>ChatByWiFi</strong><span>YOUR SPACE, TOGETHER</span></div></div>
+    <div class="sidebar-body">
+      <div class="section-label">YOUR ROOMS <button id="create-room" title="Create private room" aria-label="Create private room">+</button></div>
+      <button class="room-card active" id="network-room"><span class="room-icon network-icon"><svg viewBox="0 0 24 24"><path d="M3 9a14 14 0 0 1 18 0M6.5 12.5a8.5 8.5 0 0 1 11 0M10 16a3.5 3.5 0 0 1 4 0"/><circle cx="12" cy="19" r=".7"/></svg></span><span class="room-copy"><strong>Network room</strong><small>Everyone on your Wi-Fi</small></span><span class="room-arrow">›</span></button>
+      <button class="room-card private-card" id="sidebar-private" hidden><span class="room-icon private-icon">✳</span><span class="room-copy"><strong>Private room</strong><small>Only people with the link</small></span><span class="room-arrow">›</span></button>
+      <button class="create-card" id="create-room-2"><span>＋</span><span><strong>Create private room</strong><small>Invite anyone with a link</small></span></button>
+      <div class="sidebar-divider"></div>
+      <div class="section-label">HOW IT WORKS</div>
+      <div class="info-row"><span class="info-icon">↗</span><div><strong>Direct, device to device</strong><small>Messages travel between you, not through a server.</small></div></div>
+      <div class="info-row"><span class="info-icon">⌁</span><div><strong>Here for the moment</strong><small>Nothing is saved on a server. Your chat stays in this tab.</small></div></div>
+    </div>
+    <div class="sidebar-bottom"><div class="profile-avatar" id="profile-avatar">B</div><div class="profile-copy"><strong id="profile-name">You</strong><small>That's you!</small></div><button class="icon-button" id="profile-open" title="Edit profile" aria-label="Edit profile">✎</button></div>
+  </aside>
+  <main class="chat-panel">
+    <header class="chat-header"><div class="header-room-icon"><svg viewBox="0 0 24 24"><path d="M3 9a14 14 0 0 1 18 0M6.5 12.5a8.5 8.5 0 0 1 11 0M10 16a3.5 3.5 0 0 1 4 0"/><circle cx="12" cy="19" r=".7"/></svg></div><div class="header-title"><strong id="room-title">Network room</strong><span><i class="online-dot"></i><span id="peer-count">Connecting…</span></span></div><div class="header-actions"><button id="invite" class="invite-button"> <span>＋</span> Invite</button><button id="theme" class="icon-button" aria-label="Toggle theme" title="Toggle theme">☾</button><button id="menu" class="icon-button more" aria-label="Room options" title="Room options">⋮</button></div></header>
+    <div class="notice" id="room-notice"><span>◈</span> <span>You're in the network room. <strong>Everyone on this Wi-Fi can see this chat.</strong></span><button id="notice-close" aria-label="Dismiss notice">×</button></div>
+    <div class="chat-scroll" id="chat-scroll"><div class="messages-inner" id="messages"><div class="date-separator"><span> TODAY </span></div><div class="welcome" id="welcome"><div class="welcome-art"><span class="art-orbit orbit-one"></span><span class="art-orbit orbit-two"></span><div class="art-bubble bubble-back">•••</div><div class="art-bubble bubble-front"><svg viewBox="0 0 24 24"><path d="M4 9a12 12 0 0 1 16 0M7.5 12.5a7 7 0 0 1 9 0M11 16a2 2 0 0 1 2 0"/><circle cx="12" cy="19" r=".6"/></svg></div><span class="art-spark spark-one">✦</span><span class="art-spark spark-two">✳</span><span class="art-spark spark-three">✦</span></div><h1>A little space to connect.</h1><p>Say hello to anyone on your Wi-Fi, or invite<br class="desktop-only"> someone to a private room. It’s that simple.</p><div class="welcome-privacy"><span>♧</span> Messages are delivered only while both devices are online.<br><span class="privacy-indent">Nothing is stored on any server.</span></div><button class="welcome-invite" id="welcome-invite">＋ &nbsp; Invite someone</button></div></div></div>
+    <button id="jump" class="jump" hidden>↓ New messages</button>
+    <div id="typing" class="typing" hidden></div>
+    <footer class="composer-wrap"><div class="composer"><button class="composer-icon" id="emoji-button" title="Emoji" aria-label="Emoji">☺</button><div class="emoji-pop" id="emoji-pop" hidden></div><textarea id="input" rows="1" placeholder="Type a message" aria-label="Type a message" maxlength="4000"></textarea><button class="composer-icon attach" id="attach" title="Attach image" aria-label="Attach image">⌁</button><input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden><button class="send-button" id="send" aria-label="Send message"><svg viewBox="0 0 24 24"><path d="M4 4l17 8L4 20l2-8zM6 12h15"/></svg></button></div><div class="composer-hint"><span>♧ &nbsp; End-to-end encrypted &nbsp;·&nbsp; <span id="connection-status">Connecting…</span></span><span>Made for being together <b>♥</b></span></div></footer>
+  </main>
+</div>
+<dialog id="dialog"><div id="dialog-content"></div></dialog><div id="toast" role="status"></div>
+<script type="module" src="/js/app.js"></script>
+</body></html>
