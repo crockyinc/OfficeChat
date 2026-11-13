@@ -25,6 +25,7 @@ function profile() { $('#profile-name').textContent = name; $('#profile-avatar')
 profile();
 function updateRoom() {
   $('#room-title').textContent = roomId ? 'Private room' : 'Network room';
+  $('.header-room-icon').classList.toggle('private-room', Boolean(roomId));
   $('#network-room').classList.toggle('active', !roomId); $('#sidebar-private').hidden = !roomId;
   $('#room-notice').querySelector('span:nth-child(2)').textContent = roomId ? 'Private room · Anyone with this link can join. Share it with people you trust.' : "You're in the network room. Everyone on this Wi-Fi can see this chat.";
 }
@@ -96,7 +97,17 @@ function editProfile() {const body=document.createElement('div');body.append(par
 $('#profile-open').onclick=editProfile;
 function options() {const body=document.createElement('div');body.append(button('Edit display name','dialog-secondary',editProfile),button('Create private room','dialog-secondary',makePrivate));if(roomId)body.append(button('Go to network room','dialog-secondary',()=>location.href='/'));const originalLabel=document.createElement('label');originalLabel.className='setting-row';const check=document.createElement('input');check.type='checkbox';check.checked=original;check.onchange=()=>{original=check.checked;localStorage.setItem('cbw-original',String(original));};originalLabel.append(check,document.createTextNode('Send images in original quality'));body.append(originalLabel);if(roomId){const label=document.createElement('label');label.textContent='Room PIN (optional)';const input=document.createElement('input');input.type='password';input.autocomplete='off';input.maxLength=128;input.placeholder='Enter the same PIN on every device';label.append(input);body.append(label,paragraph(sessionStorage.getItem(`cbw-pin:${roomId}`)?'A PIN is set for this tab. Enter a new PIN or leave blank to remove it.':'A PIN encrypts negotiation and messages. It is not included in the invite link. Use a strong secret and share it separately.'));body.append(button('Apply PIN & reconnect','dialog-primary',()=>{if(input.value)sessionStorage.setItem(`cbw-pin:${roomId}`,input.value);else sessionStorage.removeItem(`cbw-pin:${roomId}`);location.reload();}));}body.append(button('Clear chat','dialog-secondary',()=>{if(confirm('Clear the chat in this tab?')){for(const el of messages.values())el.remove();messages.clear();document.querySelectorAll('.system-message').forEach(e=>e.remove());$('#welcome').hidden=false;$('#dialog').close();}}));body.append(paragraph('Messages are delivered only while both devices are online. Nothing is stored on any server.'));dialog('Room options',body);}
 $('#menu').onclick=options;
-const savedTheme=localStorage.getItem('cbw-theme');if(savedTheme==='dark'||(!savedTheme&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');$('#theme').onclick=()=>{document.documentElement.classList.toggle('dark');localStorage.setItem('cbw-theme',document.documentElement.classList.contains('dark')?'dark':'light');};
+const themePreference = matchMedia('(prefers-color-scheme: dark)');
+function setTheme(dark) {
+  document.documentElement.classList.toggle('dark', dark);
+  const label = dark ? 'Switch to light mode' : 'Switch to dark mode';
+  $('#theme').setAttribute('aria-label', label);
+  $('#theme').title = label;
+}
+const savedTheme=localStorage.getItem('cbw-theme');
+setTheme(savedTheme ? savedTheme === 'dark' : themePreference.matches);
+themePreference.addEventListener('change', event => { if (!localStorage.getItem('cbw-theme')) setTheme(event.matches); });
+$('#theme').onclick=()=>{const dark=!document.documentElement.classList.contains('dark');setTheme(dark);localStorage.setItem('cbw-theme',dark?'dark':'light');};
 for(const emoji of ['😀','😊','😂','🥰','😍','🤔','👋','👍','❤️','🎉','✨','🙌','🔥','☕','🌿','🐼','💚','😎']) {const b=button(emoji,'',()=>{$('#input').value+=emoji;$('#input').focus();$('#emoji-pop').hidden=true;});$('#emoji-pop').append(b);}$('#emoji-button').onclick=()=>$('#emoji-pop').hidden=!$('#emoji-pop').hidden;
 $('#notice-close').onclick=()=>$('#room-notice').hidden=true;
 if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));
