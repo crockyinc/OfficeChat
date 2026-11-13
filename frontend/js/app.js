@@ -1,4 +1,5 @@
 import QRCode from 'qrcode';
+import { sessionProfile } from './profile.js';
 import { derivePinKey, seal, unseal, generateRoomId, randomPeerId } from './crypto.js';
 import { validateImage, compressImage, chunkBuffer, bytesToBase64, base64ToBytes, ImageReceiver, MAX_IMAGE_BYTES, CHUNK_SIZE } from './images.js';
 import '../style.css';
@@ -8,8 +9,8 @@ const adjectives = ['Blue','Sunny','Gentle','Cosy','Happy','Silver','Clever','Lu
 const animals = ['Panda','Otter','Fox','Robin','Koala','Dolphin','Bear','Bunny','Whale','Tiger'];
 const random = (arr) => arr[crypto.getRandomValues(new Uint32Array(1))[0] % arr.length];
 const colors = ['#d79675','#78a894','#779cc1','#b894b6','#d1a666'];
-let name = localStorage.getItem('cbw-name') || `${random(adjectives)} ${random(animals)}`;
-let color = localStorage.getItem('cbw-color') || random(colors);
+let { name, color } = sessionProfile(localStorage, sessionStorage,
+  () => `${random(adjectives)} ${random(animals)}`, () => random(colors));
 let original = localStorage.getItem('cbw-original') === 'true';
 let roomId = location.pathname.match(/^\/r\/([A-Za-z0-9_-]{22})\/?$/)?.[1] || null;
 const peerId = randomPeerId();
@@ -90,7 +91,7 @@ async function shareImage(file) { const valid=validateImage(file); if(!valid.ok)
  } catch {el.querySelector('.image-loading') && (el.querySelector('.image-loading').textContent='Could not send image');toast(controller.signal.aborted?'Image transfer cancelled':'Could not process image');} finally {transfers.delete(id);} }
 $('#attach').onclick=()=>$('#file').click(); $('#file').onchange=e=>{if(e.target.files[0]) shareImage(e.target.files[0]);e.target.value='';}; document.addEventListener('paste',e=>{const file=[...(e.clipboardData?.files || [])].find(f=>f.type.startsWith('image/')); if(file){e.preventDefault();shareImage(file);}}); let dragDepth=0; const panel=$('.chat-panel'); panel.ondragenter=e=>{e.preventDefault();dragDepth++;panel.classList.add('dragging');};panel.ondragover=e=>e.preventDefault();panel.ondragleave=e=>{e.preventDefault();if(--dragDepth<=0){dragDepth=0;panel.classList.remove('dragging');}};panel.ondrop=e=>{e.preventDefault();dragDepth=0;panel.classList.remove('dragging');if(e.dataTransfer.files[0])shareImage(e.dataTransfer.files[0]);};
 function makePrivate() { location.href=`/r/${generateRoomId()}`; }
-$('#create-room').onclick=makePrivate; $('#create-room-2').onclick=makePrivate; $('#network-room').onclick=()=>location.href='/';
+$('#create-room').onclick=makePrivate; $('#create-room-2').onclick=makePrivate; $('#network-room').onclick=()=>{if(roomId) location.href='/';};
 async function invite() { if(!roomId) {const body=document.createElement('div');body.append(paragraph('Network rooms are automatic for people on the same public IP. Create a private room to invite someone on another network.'));body.append(button('Create private room','dialog-primary',makePrivate));dialog('Bring someone in',body);return;} const body=document.createElement('div');body.append(paragraph('Scan this code or share the link to invite someone. Anyone with the link can join.'));const canvas=document.createElement('canvas');canvas.className='qr'; body.append(canvas); const link=document.createElement('div');link.className='link-box';link.textContent=`${location.origin}/r/${roomId}`;body.append(link);body.append(button('Copy invite link','dialog-primary',()=>navigator.clipboard.writeText(link.textContent).then(()=>toast('Invite link copied')).catch(()=>toast('Could not copy link'))));body.append(paragraph('Using a room PIN? Share it separately, and ask everyone to enter the same PIN in room options.'));dialog('Invite to this room',body);try{await QRCode.toCanvas(canvas,link.textContent,{width:220,margin:1,color:{dark:'#183c30',light:'#ffffff'}});}catch{toast('Could not make QR code');} }
 $('#invite').onclick=invite;$('#welcome-invite').onclick=invite;
 function editProfile() {const body=document.createElement('div');body.append(paragraph('Pick a name that people in your room will recognize.'));const label=document.createElement('label');label.textContent='Display name';const input=document.createElement('input');input.type='text';input.maxLength=40;input.value=name;label.append(input);body.append(label);const colorsLabel=document.createElement('label');colorsLabel.textContent='Avatar color';const choices=document.createElement('div');for(const c of colors){const b=button('●','icon-button',()=>{color=c;});b.style.color=c;b.setAttribute('aria-label',`Choose ${c}`);choices.append(b);}body.append(colorsLabel,choices,button('Save profile','dialog-primary',()=>{name=input.value.trim().slice(0,40)||name;localStorage.setItem('cbw-name',name);localStorage.setItem('cbw-color',color);profile();broadcast({t:'hello',name,color});$('#dialog').close();}));dialog('Your profile',body);}
