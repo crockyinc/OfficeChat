@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { sessionProfile } from './profile.js';
+import { browserProfile, roomIdentity, distinctPeople, isOwnPeer } from './profile.js';
 import { createInvitation, isPrivateInvitation, isValidInvitePin } from './invitations.js';
 import { derivePinKey, seal, unseal, generateRoomId, randomPeerId } from './crypto.js';
 import { validateImage, compressImage, chunkBuffer, bytesToBase64, base64ToBytes, ImageReceiver, MAX_IMAGE_BYTES, CHUNK_SIZE } from './images.js';
@@ -10,12 +10,14 @@ const adjectives = ['Blue','Sunny','Gentle','Cosy','Happy','Silver','Clever','Lu
 const animals = ['Panda','Otter','Fox','Robin','Koala','Dolphin','Bear','Bunny','Whale','Tiger'];
 const random = (arr) => arr[crypto.getRandomValues(new Uint32Array(1))[0] % arr.length];
 const colors = ['#d79675','#78a894','#779cc1','#b894b6','#d1a666'];
-let { name, color } = sessionProfile(localStorage, sessionStorage,
-  () => `${random(adjectives)} ${random(animals)}`, () => random(colors));
+let { name, color, id: browserId } = browserProfile(localStorage, sessionStorage,
+  () => `${random(adjectives)} ${random(animals)}`, () => random(colors), generateRoomId);
+let presenceId = null, activeRoomId = null;
+let presenceReady = Promise.resolve();
 let original = localStorage.getItem('cbw-original') === 'true';
 let roomId = location.pathname.match(/^\/r\/([A-Za-z0-9_-]{22})\/?$/)?.[1] || null;
 const peerId = randomPeerId();
-let key = null, ws, permanentlyClosed = false, iceServers = [{urls:'stun:stun.l.google.com:19302'}], retry = 0, retryTimer, joined = false;
+let key = null, ws, permanentlyClosed = false, terminalStatus = 'Room is full', iceServers = [{urls:'stun:stun.l.google.com:19302'}], retry = 0, retryTimer, joined = false;
 const peers = new Map(), messages = new Map(), incoming = new ImageReceiver(), transfers = new Map();
 const pendingInvitations = new Map(), seenInvitations = new Set();
 const signalBase = (import.meta.env.VITE_SIGNAL_URL || '').replace(/\/$/, '');
@@ -43,14 +45,14 @@ function personRow(displayName, avatarColor, detail, peer) {
 function renderPeople(target) {
   target.replaceChildren();
   target.append(personRow(name,color,'You',null));
-  const others=[...peers.values()];
-  for(const peer of others) target.append(personRow(peer.name,peer.color,peer.open?'Online · Tap to invite':'Connecting…',peer));
-  if(!others.length) { const empty=document.createElement('p');empty.className='people-empty';empty.textContent=joined?'No one else is here yet.':'Looking for people…';target.append(empty); }
+  const others=distinctPeople(peers.values(),presenceId);
+  for(const peer of others) target.append(personRow(peer.name,peer.color,peer.open?'Online · Tap to invite':peer.pc.connectionState==='failed'?'Connection failed · check NAT/TURN':'Connecting…',peer));
+  if(!others.length) { const empty=document.createElement('p');empty.className='people-empty';empty.textContent=joined?'No one else is here yet. Use the same connection and disable VPNs, or invite via a private room.':'Looking for people…';target.append(empty); }
 }
 function refreshPeople() {
   if(roomId) return;
   const target=$('#sidebar-people'); if(target) renderPeople(target);
-  const total=$('#people-total'); if(total) total.textContent=String(1+[...peers.values()].filter(p=>p.open).length);
+  const total=$('#people-total'); if(total) total.textContent=String(1+distinctPeople(peers.values(),presenceId).filter(p=>p.open).length);
   const modal=$('#dialog-people'); if(modal) renderPeople(modal);
 }
 function showPeople() {
@@ -84,11 +86,17 @@ function addInvitation(otherName, id, mine) {
   el.append(heading,description,join);$('#welcome').hidden=true;$('#messages').append(el);messages.set(`invite:${uid()}`,el);scrollBottom(mine);
 }
 function deliverInvitation(peer, payload) {
+  // Each tab has its own DataChannel. Deliver to all tabs belonging to the
+  // selected browser profile so the recipient sees the invite wherever active.
+  const targets=[...peers.values()].filter(p=>p.open && (p.id===peer.id || (peer.identity && p.identity===peer.identity)));
   return new Promise((resolve,reject)=>{
     const finish=(error)=>{if(!pendingInvitations.has(payload.id)) return;clearTimeout(timer);pendingInvitations.delete(payload.id);error?reject(error):resolve();};
     const timer=setTimeout(()=>finish(new Error('Invitation was not acknowledged.')),10000);
-    pendingInvitations.set(payload.id,{peerId:peer.id,succeed:()=>finish(),fail:()=>finish(new Error('The person disconnected.'))});
-    sendTo(peer,payload).catch(()=>finish(new Error('Could not send invitation.')));
+    const peerIds=new Set(targets.map(p=>p.id));
+    const pending={peerIds,succeed:()=>finish(),fail:id=>{peerIds.delete(id);if(!peerIds.size) finish(new Error('The person disconnected.'));}};
+    pendingInvitations.set(payload.id,pending);
+    if(!targets.length) {finish(new Error('The person disconnected.'));return;}
+    for(const target of targets) sendTo(target,payload).catch(()=>pending.fail(target.id));
   });
 }
 function startPrivateInvite(peerId) {
@@ -128,7 +136,7 @@ function updateRoom() {
   $('#room-notice').querySelector('span:nth-child(2)').textContent = roomId ? 'Private room · Anyone with this link can join. Share it with people you trust.' : "You're in the network room. Everyone on this Wi-Fi can see this chat.";
 }
 updateRoom();
-function count() { const connected = [...peers.values()].filter(p => p.open).length; $('#peer-count').textContent = joined ? `${connected + 1} online · ${roomId ? 'Private room' : 'Network room'}` : 'Connecting…'; refreshPeople(); }
+function count() { const connected = distinctPeople(peers.values(),presenceId).filter(p => p.open).length; $('#peer-count').textContent = joined ? `${connected + 1} online · ${roomId ? 'Private room' : 'Network room'}` : 'Connecting…'; refreshPeople(); }
 function status(text) { $('#connection-status').textContent = text; }
 function dialog(title, body) { const d = $('#dialog'); const content = $('#dialog-content'); content.replaceChildren(); const inner = document.createElement('div'); inner.className='dialog-inner'; const head = document.createElement('div'); head.className='dialog-head'; const h = document.createElement('h2'); h.textContent=title; const close = document.createElement('button'); close.textContent='×'; close.setAttribute('aria-label','Close'); close.onclick=()=>d.close(); head.append(h,close); inner.append(head,body); content.append(inner); if (!d.open) d.showModal(); }
 function button(text, cls, fn) { const b=document.createElement('button'); b.className=cls; b.textContent=text; b.onclick=fn; return b; }
@@ -141,25 +149,26 @@ function addText(text, mine, sender, id, ts = Date.now()) { const wrap=document.
 function setState(id,state) { const ticks=messages.get(id)?.querySelector('.ticks'); if(ticks) {if(ticks.title==='delivered' && state==='sent') return; ticks.textContent=state==='delivered'?'✓✓':state==='sent'?'✓':'◷'; ticks.title=state;} }
 function sendSignal(to, data) { if(ws?.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({type:'signal',to,data})); }
 async function signal(to, type, value) { let data={type,value}; if(key) { const encrypted=await seal(key,data); data={type:'encrypted',iv:encrypted.iv,data:encrypted.data}; } sendSignal(to,data); }
-function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; peers.delete(id); for (const pending of pendingInvitations.values()) if (pending.peerId === id) pending.fail(); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(announce && p.open) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
+function hasOtherOpenTab(p) { return !!p.identity && [...peers.values()].some(other => other !== p && other.open && other.identity === p.identity); }
+function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; const notify=announce && p.open && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); peers.delete(id); for (const pending of pendingInvitations.values()) pending.fail(id); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(notify) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
 async function connectionType(p) { try { const stats=await p.pc.getStats(); for (const s of stats.values()) if(s.type==='transport' && s.selectedCandidatePairId) { const pair=stats.get(s.selectedCandidatePairId), local=stats.get(pair?.localCandidateId), remote=stats.get(pair?.remoteCandidateId); status(local?.candidateType==='relay'||remote?.candidateType==='relay'?'Connected via relay':'Connected directly'); return; } } catch {} status('Connected'); }
 function makePeer(id, initiator) {
   if(peers.has(id)) return peers.get(id);
-  const pc=new RTCPeerConnection({iceServers}); const p={id,pc,name:'Someone',color:null,open:false,dc:null,queue:Promise.resolve(),receiveQueue:Promise.resolve(), signalQueue:Promise.resolve(), candidates:[]}; peers.set(id,p); count();
+  const pc=new RTCPeerConnection({iceServers}); const p={id,pc,name:'Someone',color:null,identity:null,open:false,dc:null,queue:Promise.resolve(),receiveQueue:Promise.resolve(), signalQueue:Promise.resolve(), candidates:[]}; peers.set(id,p); count();
   pc.onicecandidate=e=>{if(e.candidate) signal(id,'ice',e.candidate.toJSON()).catch(()=>{});};
-  pc.onconnectionstatechange=()=>{ if(pc.connectionState==='connected') connectionType(p); if(pc.connectionState==='failed') { status('Connection failed · retrying'); if(initiator) pc.restartIce(); } if(pc.connectionState==='disconnected') status('Connection interrupted…'); };
+  pc.onconnectionstatechange=()=>{ if(pc.connectionState==='connected') connectionType(p); if(pc.connectionState==='failed') { status('Connection failed · check NAT/TURN'); count(); if(initiator) pc.restartIce(); } if(pc.connectionState==='disconnected') status('Connection interrupted…'); };
   pc.onnegotiationneeded=async()=>{ if(!initiator)return; try { await pc.setLocalDescription(await pc.createOffer()); await signal(id,'offer',pc.localDescription.toJSON()); } catch { status('Connection failed'); } };
-  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ sendTo(p,{t:'hello',name,color}).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {for(const pending of pendingInvitations.values()) if(pending.peerId===id) pending.fail();p.open=false; system(`${p.name} disconnected`); count(); status('Peer left');} }; };
+  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ presenceReady.then(()=>sendTo(p,{t:'hello',name,color,identity:presenceId})).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {for(const pending of pendingInvitations.values()) pending.fail(id);const notify=!isOwnPeer(p,presenceId) && !hasOtherOpenTab(p);p.open=false; if(notify) system(`${p.name} disconnected`); count(); if(notify) status('Peer left');} }; };
   if(initiator) attach(pc.createDataChannel('chat', {ordered:true})); else pc.ondatachannel=e=>attach(e.channel);
   return p;
 }
 async function handleSignal(from, data) { const p=peers.get(from) || makePeer(from,false); p.signalQueue=p.signalQueue.then(async()=>{ if(data.type==='encrypted') data=await unseal(key,{enc:1,iv:data.iv,data:data.data}); else if(key) throw Error('pin mismatch'); if(!data || !['offer','answer','ice'].includes(data.type)) return; if(data.type==='ice') { if(p.pc.remoteDescription) await p.pc.addIceCandidate(data.value); else p.candidates.push(data.value); } else { await p.pc.setRemoteDescription(data.value); for(const candidate of p.candidates.splice(0)) await p.pc.addIceCandidate(candidate); if(data.type==='offer') { await p.pc.setLocalDescription(await p.pc.createAnswer()); await signal(from,'answer',p.pc.localDescription.toJSON()); } } }).catch(()=>{ toast('Could not connect. Check that both devices use the same PIN.'); removePeer(from,false); }); }
 function sendTo(p, payload) { p.queue=p.queue.then(async()=>{ if(!p.dc || p.dc.readyState!=='open') throw Error('closed'); const wire=await seal(key,payload); p.dc.send(JSON.stringify(wire)); }); return p.queue; }
-function broadcast(payload) { return Promise.allSettled([...peers.values()].filter(p=>p.open).map(p=>sendTo(p,payload))); }
+function broadcast(payload) { return Promise.allSettled([...peers.values()].filter(p=>p.open && (payload.t==='hello' || !isOwnPeer(p,presenceId))).map(p=>sendTo(p,payload))); }
 async function receive(p, raw) {
   if(typeof raw!=='string' || raw.length>50000) throw Error('invalid message');
   const msg=await unseal(key,JSON.parse(raw)); if(!msg || typeof msg.t!=='string') return;
-  if(msg.t==='hello') { if(typeof msg.name!=='string')return; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.color=typeof msg.color==='string' && /^#[0-9a-fA-F]{6}$/.test(msg.color) ? msg.color : null; p.open=true; count(); if(first) system(`${p.name} joined the room`); connectionType(p); return; }
+  if(msg.t==='hello') { if(typeof msg.name!=='string')return; await presenceReady; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.color=typeof msg.color==='string' && /^#[0-9a-fA-F]{6}$/.test(msg.color) ? msg.color : null; p.identity=typeof msg.identity==='string' && /^[0-9a-f]{64}$/.test(msg.identity) ? msg.identity : null; const notify=first && !isOwnPeer(p,presenceId) && !hasOtherOpenTab(p); p.open=true; count(); if(notify) system(`${p.name} joined the room`); if(!isOwnPeer(p,presenceId)) connectionType(p); return; }
   if(!p.open) return;
   if(!roomId && isPrivateInvitation(msg)) {
     const seenKey = `${p.id}:${msg.id}`;
@@ -169,7 +178,7 @@ async function receive(p, raw) {
     }
     await sendTo(p,{t:'private-invite-ack',id:msg.id});
   } else if(msg.t==='private-invite-ack' && typeof msg.id==='string') {
-    const pending=pendingInvitations.get(msg.id); if(pending?.peerId===p.id) pending.succeed();
+    const pending=pendingInvitations.get(msg.id); if(pending?.peerIds.has(p.id)) pending.succeed();
   } else if(msg.t==='text' && typeof msg.text==='string' && msg.text.length<=4000 && typeof msg.id==='string' && msg.id.length<=64) { addText(msg.text,false,p.name,msg.id); await sendTo(p,{t:'ack',id:msg.id}); }
   else if(msg.t==='ack' && typeof msg.id==='string') setState(msg.id,'delivered');
   else if(msg.t==='typing') { $('#typing').textContent=`${p.name} is typing…`; $('#typing').hidden=false; clearTimeout(p.typingTimer); p.typingTimer=setTimeout(()=>$('#typing').hidden=true,2500); }
@@ -185,13 +194,13 @@ async function connect() {
   if(roomId) { const pin=sessionStorage.getItem(`cbw-pin:${roomId}`); if(pin) key=await derivePinKey(pin,roomId); }
   openSocket();
 }
-function openSocket() { status('Connecting…'); const url=signalURL('/signal'); url.protocol=url.protocol==='https:'?'wss:':'ws:'; ws=new WebSocket(url); ws.onopen=()=>{retry=0; ws.send(JSON.stringify({type:'join',mode:roomId?'private':'network',roomId,peerId,name:'Guest'}));}; ws.onmessage=event=>{ let m; try {m=JSON.parse(event.data);}catch{return;} if(m.type==='peers') {joined=true; count(); status('Waiting for someone'); for(const peer of m.list) makePeer(peer.peerId,true); } else if(m.type==='peer-joined') {makePeer(m.peer.peerId,false);} else if(m.type==='peer-left') {removePeer(m.peerId);} else if(m.type==='signal') handleSignal(m.from,m.data); else if(m.type==='error') { if(m.code==='room-full') {toast('This room is full (8 devices maximum).'); status('Room is full'); permanentlyClosed=true; ws.close(); clearTimeout(retryTimer);} else toast(`Signaling: ${m.code}`); } }; ws.onclose=()=>{joined=false; for(const id of [...peers.keys()]) removePeer(id,false); count(); status(permanentlyClosed ? 'Room is full' : 'Connecting…'); if(!permanentlyClosed) retryTimer=setTimeout(openSocket,Math.min(15000,1000*2**retry++));}; ws.onerror=()=>{}; }
-function sendText() {const text=$('#input').value.trim(); if(!text)return; const id=uid(); addText(text,true,name,id); $('#input').value=''; $('#input').style.height='auto'; const list=[...peers.values()].filter(p=>p.open); if(!list.length) {toast('No one is online to receive this message.'); return;} broadcast({t:'text',id,text}).then(results=>{if(results.some(r=>r.status==='fulfilled')) setState(id,'sent');}); }
+function openSocket() { status('Connecting…'); const url=signalURL('/signal'); url.protocol=url.protocol==='https:'?'wss:':'ws:'; ws=new WebSocket(url); ws.onopen=()=>{retry=0; ws.send(JSON.stringify({type:'join',mode:roomId?'private':'network',roomId,peerId,name:'Guest'}));}; ws.onmessage=event=>{ let m; try {m=JSON.parse(event.data);}catch{return;} if(m.type==='peers') {activeRoomId=m.roomId;presenceReady=roomIdentity(browserId,activeRoomId).then(id=>{presenceId=id;count();}); joined=true; count(); status('Waiting for someone'); for(const peer of m.list) makePeer(peer.peerId,true); } else if(m.type==='peer-joined') {makePeer(m.peer.peerId,false);} else if(m.type==='peer-left') {removePeer(m.peerId);} else if(m.type==='signal') handleSignal(m.from,m.data); else if(m.type==='error') { if(m.code==='room-full' || m.code==='network-ip-unavailable') { terminalStatus=m.code==='room-full'?'Room is full':'Network address unavailable'; toast(m.code==='room-full'?'This room is full (8 connections maximum).':'Could not determine your network address. Try a private room.'); status(terminalStatus); permanentlyClosed=true; ws.close(); clearTimeout(retryTimer);} else toast(`Signaling: ${m.code}`); } }; ws.onclose=()=>{joined=false; for(const id of [...peers.keys()]) removePeer(id,false); count(); status(permanentlyClosed ? terminalStatus : 'Connecting…'); if(!permanentlyClosed) retryTimer=setTimeout(openSocket,Math.min(15000,1000*2**retry++));}; ws.onerror=()=>{}; }
+function sendText() {const text=$('#input').value.trim(); if(!text)return; const id=uid(); addText(text,true,name,id); $('#input').value=''; $('#input').style.height='auto'; const list=[...peers.values()].filter(p=>p.open && !isOwnPeer(p,presenceId)); if(!list.length) {toast('No one is online to receive this message.'); return;} broadcast({t:'text',id,text}).then(results=>{if(results.some(r=>r.status==='fulfilled')) setState(id,'sent');}); }
 $('#send').onclick=sendText; $('#input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendText();}};
 let typingAt=0; $('#input').oninput=()=>{const t=$('#input'); t.style.height='auto'; t.style.height=Math.min(t.scrollHeight,110)+'px'; if(Date.now()-typingAt>1500) {typingAt=Date.now();broadcast({t:'typing'});} };
 function imageBubble(mine,sender,id) { const el=document.createElement('div'); el.className=`message ${mine?'out':'in'}`; if(!mine) {const n=document.createElement('div'); n.className='sender'; n.textContent=sender; el.append(n);} const loading=document.createElement('div'); loading.className='image-loading'; loading.textContent=mine?'Preparing image…':'Receiving image…'; const progress=document.createElement('progress'); progress.className='progress'; progress.max=100; progress.value=0; const cancel=button('Cancel','cancel-transfer',()=>{const controller=transfers.get(id); controller?.abort();}); if(!mine) cancel.hidden=true; const meta=document.createElement('div'); meta.className='message-meta'; const stamp=document.createElement('span'); stamp.textContent=time(Date.now()); meta.append(stamp); if(mine) {const tick=document.createElement('span');tick.className='ticks';tick.textContent='◷';meta.append(tick);} el.append(loading,progress,cancel,meta); $('#welcome').hidden=true; $('#messages').append(el); messages.set(id,el); scrollBottom(mine); return el; }
 function showImage(el, blob) { const url=URL.createObjectURL(blob); const img=document.createElement('img'); img.src=url; img.alt='Shared image'; img.className='image-thumb'; img.onclick=()=>{const body=document.createElement('div'); body.className='viewer'; const full=document.createElement('img');full.src=url;full.alt='Shared image, full size'; const a=document.createElement('a');a.className='dialog-primary';a.href=url;a.download='chatbywifi-image';a.textContent='Download image'; body.append(full,a);dialog('Shared image',body);}; el.querySelector('.image-loading')?.replaceWith(img); el.querySelector('progress')?.remove(); el.querySelector('.cancel-transfer')?.remove(); scrollBottom(); }
-async function shareImage(file) { const valid=validateImage(file); if(!valid.ok){toast(valid.error);return;} const available=[...peers.values()].filter(p=>p.open); if(!available.length){toast('No one is online to receive this image.');return;} const id=uid(), controller=new AbortController(); transfers.set(id,controller); const el=imageBubble(true,name,id); try { const {blob}=await compressImage(file,{original}); if(controller.signal.aborted) throw Error('cancelled'); const buffer=await blob.arrayBuffer(); const chunks=chunkBuffer(buffer); showImage(el,blob); // restore transfer controls while sending
+async function shareImage(file) { const valid=validateImage(file); if(!valid.ok){toast(valid.error);return;} const available=[...peers.values()].filter(p=>p.open && !isOwnPeer(p,presenceId)); if(!available.length){toast('No one is online to receive this image.');return;} const id=uid(), controller=new AbortController(); transfers.set(id,controller); const el=imageBubble(true,name,id); try { const {blob}=await compressImage(file,{original}); if(controller.signal.aborted) throw Error('cancelled'); const buffer=await blob.arrayBuffer(); const chunks=chunkBuffer(buffer); showImage(el,blob); // restore transfer controls while sending
   const progress=document.createElement('progress');progress.className='progress';progress.max=100;progress.value=0; const cancel=button('Cancel','cancel-transfer',()=>controller.abort());el.insertBefore(progress,el.lastChild);el.insertBefore(cancel,el.lastChild);
   const results=await Promise.allSettled(available.map(async p=>{await sendTo(p,{t:'img-start',id,size:blob.size,mime:blob.type}); for(let seq=0;seq<chunks.length;seq++){if(controller.signal.aborted){await sendTo(p,{t:'img-cancel',id});return;} while(p.dc.readyState==='open' && p.dc.bufferedAmount>512*1024 && !controller.signal.aborted) await new Promise(resolve=>setTimeout(resolve,50)); if(p.dc.readyState!=='open') throw Error('closed'); await sendTo(p,{t:'img-chunk',id,seq,data:bytesToBase64(chunks[seq])}); progress.value=Math.round((seq+1)/chunks.length*100); } if(controller.signal.aborted) {await sendTo(p,{t:'img-cancel',id});return;} await sendTo(p,{t:'img-end',id}); })); progress.remove();cancel.remove();if(controller.signal.aborted) toast('Image transfer cancelled'); else if(results.some(r=>r.status==='fulfilled')) setState(id,'sent');else toast('Image transfer failed');
  } catch {el.querySelector('.image-loading') && (el.querySelector('.image-loading').textContent='Could not send image');toast(controller.signal.aborted?'Image transfer cancelled':'Could not process image');} finally {transfers.delete(id);} }
@@ -201,8 +210,19 @@ $('#create-room').onclick=makePrivate; $('#create-room-2').onclick=makePrivate; 
 async function invite() { if(!roomId) {showPeople();return;} const body=document.createElement('div');body.append(paragraph('Scan this code or share the link to invite someone. Anyone with the link can join.'));const canvas=document.createElement('canvas');canvas.className='qr'; body.append(canvas); const link=document.createElement('div');link.className='link-box';link.textContent=`${location.origin}/r/${roomId}`;body.append(link);body.append(button('Copy invite link','dialog-primary',()=>navigator.clipboard.writeText(link.textContent).then(()=>toast('Invite link copied')).catch(()=>toast('Could not copy link'))));body.append(paragraph('Using a room PIN? Share it separately, and ask everyone to enter the same PIN in room options.'));dialog('Invite to this room',body);try{await QRCode.toCanvas(canvas,link.textContent,{width:220,margin:1,color:{dark:'#183c30',light:'#ffffff'}});}catch{toast('Could not make QR code');} }
 $('#invite').onclick=invite;$('#welcome-invite').onclick=invite;
 $('#people-open').onclick=showPeople;
-function editProfile() {const body=document.createElement('div');body.append(paragraph('Pick a name that people in your room will recognize.'));const label=document.createElement('label');label.textContent='Display name';const input=document.createElement('input');input.type='text';input.maxLength=40;input.value=name;label.append(input);body.append(label);const colorsLabel=document.createElement('label');colorsLabel.textContent='Avatar color';const choices=document.createElement('div');for(const c of colors){const b=button('●','icon-button',()=>{color=c;});b.style.color=c;b.setAttribute('aria-label',`Choose ${c}`);choices.append(b);}body.append(colorsLabel,choices,button('Save profile','dialog-primary',()=>{name=input.value.trim().slice(0,40)||name;localStorage.setItem('cbw-name',name);localStorage.setItem('cbw-color',color);profile();broadcast({t:'hello',name,color});$('#dialog').close();}));dialog('Your profile',body);}
+function editProfile() {const body=document.createElement('div');body.append(paragraph('Pick a name that people in your room will recognize.'));const label=document.createElement('label');label.textContent='Display name';const input=document.createElement('input');input.type='text';input.maxLength=40;input.value=name;label.append(input);body.append(label);const colorsLabel=document.createElement('label');colorsLabel.textContent='Avatar color';const choices=document.createElement('div');for(const c of colors){const b=button('●','icon-button',()=>{color=c;});b.style.color=c;b.setAttribute('aria-label',`Choose ${c}`);choices.append(b);}body.append(colorsLabel,choices,button('Save profile','dialog-primary',()=>{name=input.value.trim().slice(0,40)||name;localStorage.setItem('cbw-name',name);localStorage.setItem('cbw-color',color);profile();broadcast({t:'hello',name,color,identity:presenceId});$('#dialog').close();}));dialog('Your profile',body);}
 $('#profile-open').onclick=editProfile;
+window.addEventListener('storage', event => {
+  if (event.storageArea !== localStorage || !['cbw-name','cbw-color','cbw-browser-id'].includes(event.key)) return;
+  if (event.key === 'cbw-browser-id' && event.newValue && activeRoomId) {
+    browserId=event.newValue;
+    presenceReady=roomIdentity(browserId,activeRoomId).then(id=>{presenceId=id;count();});
+  }
+  name=localStorage.getItem('cbw-name') || name;
+  color=localStorage.getItem('cbw-color') || color;
+  profile();
+  presenceReady.then(()=>broadcast({t:'hello',name,color,identity:presenceId}));
+});
 function options() {const body=document.createElement('div');body.append(button('Edit display name','dialog-secondary',editProfile),button('Create private room','dialog-secondary',makePrivate));if(roomId)body.append(button('Go to network room','dialog-secondary',()=>location.href='/'));const originalLabel=document.createElement('label');originalLabel.className='setting-row';const check=document.createElement('input');check.type='checkbox';check.checked=original;check.onchange=()=>{original=check.checked;localStorage.setItem('cbw-original',String(original));};originalLabel.append(check,document.createTextNode('Send images in original quality'));body.append(originalLabel);if(roomId){const label=document.createElement('label');label.textContent='Room PIN (optional)';const input=document.createElement('input');input.type='password';input.autocomplete='off';input.maxLength=128;input.placeholder='Enter the same PIN on every device';label.append(input);body.append(label,paragraph(sessionStorage.getItem(`cbw-pin:${roomId}`)?'A PIN is set for this tab. Enter a new PIN or leave blank to remove it.':'A PIN encrypts negotiation and messages. It is not included in the invite link. Use a strong secret and share it separately.'));body.append(button('Apply PIN & reconnect','dialog-primary',()=>{if(input.value)sessionStorage.setItem(`cbw-pin:${roomId}`,input.value);else sessionStorage.removeItem(`cbw-pin:${roomId}`);location.reload();}));}body.append(button('Clear chat','dialog-secondary',()=>{if(confirm('Clear the chat in this tab?')){for(const el of messages.values())el.remove();messages.clear();document.querySelectorAll('.system-message').forEach(e=>e.remove());$('#welcome').hidden=false;$('#dialog').close();}}));body.append(paragraph('Messages are delivered only while both devices are online. Nothing is stored on any server.'));dialog('Room options',body);}
 $('#menu').onclick=options;
 const themePreference = matchMedia('(prefers-color-scheme: dark)');

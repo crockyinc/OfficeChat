@@ -11,7 +11,7 @@
 //     directly between browsers over RTCDataChannels (DTLS-encrypted).
 //   - Message payloads are never logged. Logs contain only counts.
 
-import { SignalingCore, clientIpFromHeaders } from './core.js';
+import { SignalingCore, deriveNetworkRoomId } from './core.js';
 
 export class SignalingRoom {
   constructor() {
@@ -33,11 +33,11 @@ export class SignalingRoom {
     this.sockets.set(connId, server);
     this.core.connect(connId);
     server.accept();
+    const trustedNetworkRoomId = request.headers.get('X-ChatByWiFi-Network-Room');
     let queue = Promise.resolve();
     server.addEventListener('message', async (event) => {
       queue = queue.then(async () => {
-        const ip = clientIpFromHeaders(request.headers, connId);
-        const actions = await this.core.message(connId, event.data, ip);
+        const actions = await this.core.message(connId, event.data, null, { trustedNetworkRoomId, requireTrustedNetworkRoom: true });
         this.#run(actions);
       }).catch(() => { try { server.close(1011, 'signaling error'); } catch {} });
     });
@@ -97,8 +97,17 @@ export default {
     }
 
     if (url.pathname === '/signal') {
+      // Read the visitor's trusted IP at the edge, before forwarding the
+      // request into the Durable Object. Never accept a client-supplied room.
+      const headers = new Headers(request.headers);
+      headers.delete('X-ChatByWiFi-Network-Room');
+      const ip = request.headers.get('CF-Connecting-IP');
+      if (ip) {
+        try { headers.set('X-ChatByWiFi-Network-Room', await deriveNetworkRoomId(ip)); }
+        catch { /* Private rooms still work if the edge IP is unavailable. */ }
+      }
       const stub = env.SIGNALING.get(env.SIGNALING.idFromName('chatbywifi'));
-      return stub.fetch(request);
+      return stub.fetch(new Request(request, { headers }));
     }
 
     return new Response('ChatByWiFi signaling service.', { status: 404 });

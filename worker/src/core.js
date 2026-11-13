@@ -1,3 +1,5 @@
+import { normalizeNetworkAddress } from './network.js';
+
 // Pure, runtime-agnostic signaling core for ChatByWiFi.
 //
 // This module contains ALL signaling logic but knows nothing about
@@ -44,11 +46,13 @@ export function isValidName(name) {
 
 /**
  * Derive the Network Room id from a client's public IP.
- * Same public IP -> same room. The raw IP is never stored or logged;
+ * Same IPv4 address or IPv6 /64 -> same room. The IP is never stored or logged;
  * only the first 16 hex chars of SHA-256(ip + salt) are used.
  */
 export async function deriveNetworkRoomId(ip, salt = 'chatbywifi-v1') {
-  const data = new TextEncoder().encode(`${salt}:${ip}`);
+  const address = normalizeNetworkAddress(ip);
+  if (!address) throw new Error('Invalid client IP');
+  const data = new TextEncoder().encode(`${salt}:${address}`);
   const digest = await crypto.subtle.digest('SHA-256', data);
   const hex = [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -56,23 +60,6 @@ export async function deriveNetworkRoomId(ip, salt = 'chatbywifi-v1') {
   return `net-${hex.slice(0, 16)}`;
 }
 
-/**
- * Extract the client IP from a request, preferring Cloudflare's header.
- * Falls back to X-Forwarded-For, then to a per-connection random value
- * (so local dev without proxies still works, one room per connection).
- */
-export function clientIpFromHeaders(headers, fallback = 'unknown') {
-  const get = (name) => {
-    if (!headers) return null;
-    if (typeof headers.get === 'function') return headers.get(name);
-    return headers[name] ?? headers[name.toLowerCase()] ?? null;
-  };
-  const cf = get('cf-connecting-ip');
-  if (cf) return cf.split(',')[0].trim();
-  const xff = get('x-forwarded-for');
-  if (xff) return xff.split(',')[0].trim();
-  return fallback;
-}
 
 export class SignalingCore {
   constructor() {
@@ -101,7 +88,7 @@ export class SignalingCore {
    * @param {string} ip client IP (used only for network-room derivation)
    * @returns {Array<{to: string, msg: object} | {close: string, code?: number, reason?: string}>}
    */
-  async message(connId, raw, ip) {
+  async message(connId, raw, ip, options = {}) {
     const conn = this.conns.get(connId);
     if (!conn) return [];
 
@@ -127,7 +114,7 @@ export class SignalingCore {
 
     switch (msg.type) {
       case 'join':
-        return this.#join(connId, conn, msg, ip);
+        return this.#join(connId, conn, msg, ip, options);
       case 'signal':
         return this.#signal(connId, conn, msg);
       case 'leave':
@@ -159,7 +146,7 @@ export class SignalingCore {
     return true;
   }
 
-  async #join(connId, conn, msg, ip) {
+  async #join(connId, conn, msg, ip, options) {
     if (conn.roomId) {
       return [{ to: connId, msg: { type: 'error', code: 'already-joined' } }];
     }
@@ -177,8 +164,15 @@ export class SignalingCore {
     let roomId;
     let roomKind;
     if (msg.mode === 'network' || !msg.roomId) {
-      roomId = await deriveNetworkRoomId(ip ?? 'unknown');
-      if (this.conns.get(connId) !== conn) return [];
+      if (options.trustedNetworkRoomId && NETWORK_ROOM_RE.test(options.trustedNetworkRoomId)) {
+        roomId = options.trustedNetworkRoomId;
+      } else if (options.requireTrustedNetworkRoom) {
+        return [{ to: connId, msg: { type: 'error', code: 'network-ip-unavailable' } }];
+      } else {
+        try { roomId = await deriveNetworkRoomId(ip); }
+        catch { return [{ to: connId, msg: { type: 'error', code: 'network-ip-unavailable' } }]; }
+        if (this.conns.get(connId) !== conn) return [];
+      }
       roomKind = 'network';
     } else {
       if (!PRIVATE_ROOM_RE.test(msg.roomId)) {
