@@ -19,3 +19,18 @@
 .dark .network-icon,.dark .header-room-icon{background:#284b3e;color:#7ad5a9}.dark .private-icon{background:#304657;color:#a9cde9}.dark .info-icon{background:#2a4138;color:#8bc9a8}.dark .create-card>span:first-child{border-color:#526f60;color:#9dcbb2}.dark .composer-icon:hover{background:#30443b;color:#85d9ae}
 @media (max-width:700px){.invite-button .icon{width:15px;height:15px}}
 .dark{color:var(--text)}
+
+/* Live network roster and private invitations */
+.sidebar-body{overflow-y:auto}
+.people-total{font-size:10px;letter-spacing:0;color:#70a389;background:#edf7f0;border-radius:10px;padding:3px 7px}
+.people-list{display:flex;flex-direction:column;gap:3px}
+.person-row{width:100%;display:flex;align-items:center;gap:10px;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:var(--text);text-align:left}
+button.person-row:hover{background:#edf8f1}
+.person-row:disabled{cursor:default;opacity:.7}
+.person-avatar{position:relative;display:grid;place-items:center;flex:none;width:36px;height:36px;border-radius:50%;background:#84a999;color:white;font-size:13px;font-weight:700}
+.person-avatar.online:after{content:'';position:absolute;right:-1px;bottom:0;width:8px;height:8px;border-radius:50%;background:#4bbd84;border:2px solid var(--sidebar)}
+.person-details{min-width:0;flex:1}.person-details strong,.person-details small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.person-details strong{font-size:12px}.person-details small{font-size:10px;color:var(--muted);margin-top:4px}.person-action{font-size:10px;color:#168b69;font-weight:700;white-space:nowrap}.people-hint,.people-empty{padding:0 10px;color:var(--muted);font-size:10px;line-height:1.5}.people-empty{margin:10px 0}
+.invitation-card{min-width:220px}.invitation-heading{font-weight:700;margin-bottom:4px}.invitation-description{font-size:12px;color:var(--muted);line-height:1.5}.invitation-join{display:block;width:100%;border:0;border-top:1px solid #a1cdb999;background:transparent;color:#168b69;font-size:12px;font-weight:700;padding:10px 4px 3px;margin-top:9px}.invitation-join:hover{text-decoration:underline}
+.dialog-inner .invite-note{font-size:11px}.dialog-inner .invite-error{color:#bb554e;font-size:12px}.dialog-inner .people-list{max-height:50vh;overflow-y:auto}
+.dark .people-total{background:#2a4138;color:#a6d7b9}.dark button.person-row:hover{background:#30443b}.dark .person-action,.dark .invitation-join{color:#79d8ab}.dark .invitation-description{color:#b1c6bb}
+@media(max-width:420px){.chat-header{padding-left:10px;padding-right:10px;gap:8px}.header-actions{gap:0}.header-title strong{font-size:13px}.header-title>span{font-size:10px}.invite-button{padding:8px}.icon-button{min-width:32px}}

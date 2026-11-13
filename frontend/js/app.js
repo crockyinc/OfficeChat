@@ -1,5 +1,6 @@
 import QRCode from 'qrcode';
 import { sessionProfile } from './profile.js';
+import { createInvitation, isPrivateInvitation, isValidInvitePin } from './invitations.js';
 import { derivePinKey, seal, unseal, generateRoomId, randomPeerId } from './crypto.js';
 import { validateImage, compressImage, chunkBuffer, bytesToBase64, base64ToBytes, ImageReceiver, MAX_IMAGE_BYTES, CHUNK_SIZE } from './images.js';
 import '../style.css';
@@ -16,22 +17,118 @@ let roomId = location.pathname.match(/^\/r\/([A-Za-z0-9_-]{22})\/?$/)?.[1] || nu
 const peerId = randomPeerId();
 let key = null, ws, permanentlyClosed = false, iceServers = [{urls:'stun:stun.l.google.com:19302'}], retry = 0, retryTimer, joined = false;
 const peers = new Map(), messages = new Map(), incoming = new ImageReceiver(), transfers = new Map();
+const pendingInvitations = new Map(), seenInvitations = new Set();
 const signalBase = (import.meta.env.VITE_SIGNAL_URL || '').replace(/\/$/, '');
 const signalURL = (path) => new URL(signalBase + path, location.origin);
 const escapeText = (text) => document.createTextNode(text);
 const uid = () => crypto.randomUUID();
 let toastTimer;
 function toast(text) { $('#toast').textContent = text; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 3000); }
-function profile() { $('#profile-name').textContent = name; $('#profile-avatar').textContent = name[0]?.toUpperCase() || '?'; $('#profile-avatar').style.background = color; }
+// The roster only contains people in this network room who use the app.
+// Names and colors arrive over the DataChannel, never through signaling.
+function personRow(displayName, avatarColor, detail, peer) {
+  const row=document.createElement(peer ? 'button' : 'div');
+  row.className='person-row';
+  if(peer) { row.type='button'; row.disabled=!peer.open; row.onclick=()=>startPrivateInvite(peer.id); }
+  const avatar=document.createElement('span'); avatar.className=`person-avatar${!peer || peer.open ? ' online' : ''}`;
+  avatar.textContent=displayName.slice(0,1).toUpperCase() || '?';
+  if(avatarColor) avatar.style.backgroundColor=avatarColor;
+  const details=document.createElement('span'); details.className='person-details';
+  const title=document.createElement('strong'); title.textContent=displayName;
+  const subtitle=document.createElement('small'); subtitle.textContent=detail;
+  details.append(title,subtitle); row.append(avatar,details);
+  if(peer?.open) { const action=document.createElement('span'); action.className='person-action'; action.textContent='Invite'; row.append(action); row.setAttribute('aria-label',`Invite ${displayName} to a private chat`); }
+  return row;
+}
+function renderPeople(target) {
+  target.replaceChildren();
+  target.append(personRow(name,color,'You',null));
+  const others=[...peers.values()];
+  for(const peer of others) target.append(personRow(peer.name,peer.color,peer.open?'Online · Tap to invite':'Connecting…',peer));
+  if(!others.length) { const empty=document.createElement('p');empty.className='people-empty';empty.textContent=joined?'No one else is here yet.':'Looking for people…';target.append(empty); }
+}
+function refreshPeople() {
+  if(roomId) return;
+  const target=$('#sidebar-people'); if(target) renderPeople(target);
+  const total=$('#people-total'); if(total) total.textContent=String(1+[...peers.values()].filter(p=>p.open).length);
+  const modal=$('#dialog-people'); if(modal) renderPeople(modal);
+}
+function showPeople() {
+  const body=document.createElement('div');
+  body.append(paragraph('People currently in your network room. Select a connected person to invite them to a private chat.'));
+  const list=document.createElement('div');list.id='dialog-people';list.className='people-list';body.append(list);
+  body.append(button('Create a room for someone else','dialog-secondary',makePrivate));
+  dialog('People on your network',body);refreshPeople();
+}
+function pinField(labelText) {
+  const label=document.createElement('label');label.textContent=labelText;
+  const input=document.createElement('input');input.type='password';input.autocomplete='off';input.maxLength=128;input.placeholder='At least 6 characters';
+  label.append(input);return {label,input};
+}
+function joinPrivateRoom(id,pin) {
+  sessionStorage.setItem(`cbw-pin:${id}`,pin);
+  location.href=`/r/${id}`;
+}
+function addInvitation(otherName, id, mine) {
+  const el=document.createElement('div');el.className=`message invitation-card ${mine?'out':'in'}`;
+  const heading=document.createElement('div');heading.className='invitation-heading';heading.textContent=mine?'Private chat invitation':`${otherName} invited you to chat`;
+  const description=document.createElement('div');description.className='invitation-description';description.textContent=mine?`Sent to ${otherName}. Share your PIN separately.`:'Ask for the PIN separately, then enter it to join.';
+  const join=button(mine?'Open private chat':'Enter PIN & join','invitation-join',()=>{
+    if(mine) { const pin=sessionStorage.getItem(`cbw-pin:${id}`); if(pin) joinPrivateRoom(id,pin); else toast('This invitation is no longer available in this tab.'); return; }
+    const body=document.createElement('div');body.append(paragraph(`Enter the PIN ${otherName} shared with you. The PIN is not included in the invitation.`));
+    const {label,input}=pinField('Private chat PIN');body.append(label);
+    const error=document.createElement('p');error.className='invite-error';error.hidden=true;body.append(error);
+    body.append(button('Join private chat','dialog-primary',()=>{if(!isValidInvitePin(input.value)){error.textContent='Enter the PIN (at least 6 characters).';error.hidden=false;return;}joinPrivateRoom(id,input.value);}));
+    dialog('Join private chat',body);input.focus();
+  });
+  el.append(heading,description,join);$('#welcome').hidden=true;$('#messages').append(el);messages.set(`invite:${uid()}`,el);scrollBottom(mine);
+}
+function deliverInvitation(peer, payload) {
+  return new Promise((resolve,reject)=>{
+    const finish=(error)=>{if(!pendingInvitations.has(payload.id)) return;clearTimeout(timer);pendingInvitations.delete(payload.id);error?reject(error):resolve();};
+    const timer=setTimeout(()=>finish(new Error('Invitation was not acknowledged.')),10000);
+    pendingInvitations.set(payload.id,{peerId:peer.id,succeed:()=>finish(),fail:()=>finish(new Error('The person disconnected.'))});
+    sendTo(peer,payload).catch(()=>finish(new Error('Could not send invitation.')));
+  });
+}
+function startPrivateInvite(peerId) {
+  const peer=peers.get(peerId);
+  if(roomId || !peer?.open) {toast('This person is no longer connected.');return;}
+  const body=document.createElement('div');
+  body.append(paragraph(`Create a PIN for a private chat with ${peer.name}. Share it with them separately, not in the network chat.`));
+  const {label,input}=pinField('Create a PIN');body.append(label);
+  const note=paragraph('The invitation contains a private room link, never the PIN. Use a long, hard-to-guess secret.');note.className='invite-note';body.append(note);
+  const error=document.createElement('p');error.className='invite-error';error.hidden=true;body.append(error);
+  const send=button('Send invitation','dialog-primary',async()=>{
+    const pin=input.value;
+    if(!isValidInvitePin(pin)){error.textContent='Choose a PIN with at least 6 characters.';error.hidden=false;return;}
+    if(peers.get(peerId)!==peer || !peer.open){error.textContent='This person is no longer connected.';error.hidden=false;return;}
+    send.disabled=true;send.textContent='Sending…';error.hidden=true;
+    const id=generateRoomId();
+    try {
+      await deliverInvitation(peer,createInvitation(uid(),id));
+      sessionStorage.setItem(`cbw-pin:${id}`,pin);
+      addInvitation(peer.name,id,true);
+      if($('#dialog-content').contains(body)) {
+        const done=document.createElement('div');done.append(paragraph(`Invitation delivered to ${peer.name}. Share your PIN separately, then open your private chat.`));
+        done.append(button('Open private chat','dialog-primary',()=>joinPrivateRoom(id,pin)));
+        dialog('Invitation sent',done);
+      } else toast('Invitation delivered. Open it in the chat when ready.');
+    } catch {if($('#dialog-content').contains(body)){error.textContent='Invitation could not be delivered. Check that the person is still online and try again.';error.hidden=false;send.disabled=false;send.textContent='Send invitation';}else toast('Invitation could not be delivered.');}
+  });
+  body.append(send);dialog(`Invite ${peer.name}`,body);input.focus();
+}
+function profile() { $('#profile-name').textContent = name; $('#profile-avatar').textContent = name[0]?.toUpperCase() || '?'; $('#profile-avatar').style.background = color; refreshPeople(); }
 profile();
 function updateRoom() {
   $('#room-title').textContent = roomId ? 'Private room' : 'Network room';
   $('.header-room-icon').classList.toggle('private-room', Boolean(roomId));
   $('#network-room').classList.toggle('active', !roomId); $('#sidebar-private').hidden = !roomId;
+  $('#network-people-section').hidden = Boolean(roomId); $('#people-open').hidden = Boolean(roomId);
   $('#room-notice').querySelector('span:nth-child(2)').textContent = roomId ? 'Private room · Anyone with this link can join. Share it with people you trust.' : "You're in the network room. Everyone on this Wi-Fi can see this chat.";
 }
 updateRoom();
-function count() { const connected = [...peers.values()].filter(p => p.open).length; $('#peer-count').textContent = joined ? `${connected + 1} online · ${roomId ? 'Private room' : 'Network room'}` : 'Connecting…'; }
+function count() { const connected = [...peers.values()].filter(p => p.open).length; $('#peer-count').textContent = joined ? `${connected + 1} online · ${roomId ? 'Private room' : 'Network room'}` : 'Connecting…'; refreshPeople(); }
 function status(text) { $('#connection-status').textContent = text; }
 function dialog(title, body) { const d = $('#dialog'); const content = $('#dialog-content'); content.replaceChildren(); const inner = document.createElement('div'); inner.className='dialog-inner'; const head = document.createElement('div'); head.className='dialog-head'; const h = document.createElement('h2'); h.textContent=title; const close = document.createElement('button'); close.textContent='×'; close.setAttribute('aria-label','Close'); close.onclick=()=>d.close(); head.append(h,close); inner.append(head,body); content.append(inner); if (!d.open) d.showModal(); }
 function button(text, cls, fn) { const b=document.createElement('button'); b.className=cls; b.textContent=text; b.onclick=fn; return b; }
@@ -44,15 +141,15 @@ function addText(text, mine, sender, id, ts = Date.now()) { const wrap=document.
 function setState(id,state) { const ticks=messages.get(id)?.querySelector('.ticks'); if(ticks) {if(ticks.title==='delivered' && state==='sent') return; ticks.textContent=state==='delivered'?'✓✓':state==='sent'?'✓':'◷'; ticks.title=state;} }
 function sendSignal(to, data) { if(ws?.readyState !== WebSocket.OPEN) return; ws.send(JSON.stringify({type:'signal',to,data})); }
 async function signal(to, type, value) { let data={type,value}; if(key) { const encrypted=await seal(key,data); data={type:'encrypted',iv:encrypted.iv,data:encrypted.data}; } sendSignal(to,data); }
-function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; peers.delete(id); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(announce && p.open) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
+function removePeer(id, announce=true) { const p=peers.get(id); if(!p)return; peers.delete(id); for (const pending of pendingInvitations.values()) if (pending.peerId === id) pending.fail(); for(const transferId of incoming.transfers.keys()) if(transferId.startsWith(`${id}:`)) incoming.cancel(transferId); p.pc.close(); if(announce && p.open) system(`${p.name} left the room`); count(); status(peers.size ? 'Reconnecting…' : 'Waiting for someone'); }
 async function connectionType(p) { try { const stats=await p.pc.getStats(); for (const s of stats.values()) if(s.type==='transport' && s.selectedCandidatePairId) { const pair=stats.get(s.selectedCandidatePairId), local=stats.get(pair?.localCandidateId), remote=stats.get(pair?.remoteCandidateId); status(local?.candidateType==='relay'||remote?.candidateType==='relay'?'Connected via relay':'Connected directly'); return; } } catch {} status('Connected'); }
 function makePeer(id, initiator) {
   if(peers.has(id)) return peers.get(id);
-  const pc=new RTCPeerConnection({iceServers}); const p={id,pc,name:'Someone',open:false,dc:null,queue:Promise.resolve(),receiveQueue:Promise.resolve(), signalQueue:Promise.resolve(), candidates:[]}; peers.set(id,p);
+  const pc=new RTCPeerConnection({iceServers}); const p={id,pc,name:'Someone',color:null,open:false,dc:null,queue:Promise.resolve(),receiveQueue:Promise.resolve(), signalQueue:Promise.resolve(), candidates:[]}; peers.set(id,p); count();
   pc.onicecandidate=e=>{if(e.candidate) signal(id,'ice',e.candidate.toJSON()).catch(()=>{});};
   pc.onconnectionstatechange=()=>{ if(pc.connectionState==='connected') connectionType(p); if(pc.connectionState==='failed') { status('Connection failed · retrying'); if(initiator) pc.restartIce(); } if(pc.connectionState==='disconnected') status('Connection interrupted…'); };
   pc.onnegotiationneeded=async()=>{ if(!initiator)return; try { await pc.setLocalDescription(await pc.createOffer()); await signal(id,'offer',pc.localDescription.toJSON()); } catch { status('Connection failed'); } };
-  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ sendTo(p,{t:'hello',name,color}).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {p.open=false; system(`${p.name} disconnected`); count(); status('Peer left');} }; };
+  const attach=dc=>{ p.dc=dc; dc.bufferedAmountLowThreshold=256*1024; dc.onopen=()=>{ sendTo(p,{t:'hello',name,color}).catch(()=>{}); }; dc.onmessage=e=>{ p.receiveQueue=p.receiveQueue.then(()=>receive(p,e.data)).catch(()=>{ toast('Could not verify peer. Check your room PIN.'); removePeer(id,false); }); }; dc.onclose=()=>{ if(peers.get(id)===p && p.open) {for(const pending of pendingInvitations.values()) if(pending.peerId===id) pending.fail();p.open=false; system(`${p.name} disconnected`); count(); status('Peer left');} }; };
   if(initiator) attach(pc.createDataChannel('chat', {ordered:true})); else pc.ondatachannel=e=>attach(e.channel);
   return p;
 }
@@ -62,9 +159,18 @@ function broadcast(payload) { return Promise.allSettled([...peers.values()].filt
 async function receive(p, raw) {
   if(typeof raw!=='string' || raw.length>50000) throw Error('invalid message');
   const msg=await unseal(key,JSON.parse(raw)); if(!msg || typeof msg.t!=='string') return;
-  if(msg.t==='hello') { if(typeof msg.name!=='string')return; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.open=true; count(); if(first) system(`${p.name} joined the room`); connectionType(p); return; }
+  if(msg.t==='hello') { if(typeof msg.name!=='string')return; const first=!p.open; p.name=msg.name.slice(0,40) || 'Someone'; p.color=typeof msg.color==='string' && /^#[0-9a-fA-F]{6}$/.test(msg.color) ? msg.color : null; p.open=true; count(); if(first) system(`${p.name} joined the room`); connectionType(p); return; }
   if(!p.open) return;
-  if(msg.t==='text' && typeof msg.text==='string' && msg.text.length<=4000 && typeof msg.id==='string' && msg.id.length<=64) { addText(msg.text,false,p.name,msg.id); await sendTo(p,{t:'ack',id:msg.id}); }
+  if(!roomId && isPrivateInvitation(msg)) {
+    const seenKey = `${p.id}:${msg.id}`;
+    if(!seenInvitations.has(seenKey)) {
+      if(seenInvitations.size >= 100) seenInvitations.delete(seenInvitations.values().next().value);
+      seenInvitations.add(seenKey); addInvitation(p.name, msg.roomId, false); toast(`${p.name} invited you to a private chat`);
+    }
+    await sendTo(p,{t:'private-invite-ack',id:msg.id});
+  } else if(msg.t==='private-invite-ack' && typeof msg.id==='string') {
+    const pending=pendingInvitations.get(msg.id); if(pending?.peerId===p.id) pending.succeed();
+  } else if(msg.t==='text' && typeof msg.text==='string' && msg.text.length<=4000 && typeof msg.id==='string' && msg.id.length<=64) { addText(msg.text,false,p.name,msg.id); await sendTo(p,{t:'ack',id:msg.id}); }
   else if(msg.t==='ack' && typeof msg.id==='string') setState(msg.id,'delivered');
   else if(msg.t==='typing') { $('#typing').textContent=`${p.name} is typing…`; $('#typing').hidden=false; clearTimeout(p.typingTimer); p.typingTimer=setTimeout(()=>$('#typing').hidden=true,2500); }
   else if(msg.t==='img-start' && typeof msg.id==='string' && msg.id.length<=64 && Number.isSafeInteger(msg.size) && msg.size>0 && msg.size<=MAX_IMAGE_BYTES && ['image/png','image/jpeg','image/webp','image/gif'].includes(msg.mime)) {
@@ -92,8 +198,9 @@ async function shareImage(file) { const valid=validateImage(file); if(!valid.ok)
 $('#attach').onclick=()=>$('#file').click(); $('#file').onchange=e=>{if(e.target.files[0]) shareImage(e.target.files[0]);e.target.value='';}; document.addEventListener('paste',e=>{const file=[...(e.clipboardData?.files || [])].find(f=>f.type.startsWith('image/')); if(file){e.preventDefault();shareImage(file);}}); let dragDepth=0; const panel=$('.chat-panel'); panel.ondragenter=e=>{e.preventDefault();dragDepth++;panel.classList.add('dragging');};panel.ondragover=e=>e.preventDefault();panel.ondragleave=e=>{e.preventDefault();if(--dragDepth<=0){dragDepth=0;panel.classList.remove('dragging');}};panel.ondrop=e=>{e.preventDefault();dragDepth=0;panel.classList.remove('dragging');if(e.dataTransfer.files[0])shareImage(e.dataTransfer.files[0]);};
 function makePrivate() { location.href=`/r/${generateRoomId()}`; }
 $('#create-room').onclick=makePrivate; $('#create-room-2').onclick=makePrivate; $('#network-room').onclick=()=>{if(roomId) location.href='/';};
-async function invite() { if(!roomId) {const body=document.createElement('div');body.append(paragraph('Network rooms are automatic for people on the same public IP. Create a private room to invite someone on another network.'));body.append(button('Create private room','dialog-primary',makePrivate));dialog('Bring someone in',body);return;} const body=document.createElement('div');body.append(paragraph('Scan this code or share the link to invite someone. Anyone with the link can join.'));const canvas=document.createElement('canvas');canvas.className='qr'; body.append(canvas); const link=document.createElement('div');link.className='link-box';link.textContent=`${location.origin}/r/${roomId}`;body.append(link);body.append(button('Copy invite link','dialog-primary',()=>navigator.clipboard.writeText(link.textContent).then(()=>toast('Invite link copied')).catch(()=>toast('Could not copy link'))));body.append(paragraph('Using a room PIN? Share it separately, and ask everyone to enter the same PIN in room options.'));dialog('Invite to this room',body);try{await QRCode.toCanvas(canvas,link.textContent,{width:220,margin:1,color:{dark:'#183c30',light:'#ffffff'}});}catch{toast('Could not make QR code');} }
+async function invite() { if(!roomId) {showPeople();return;} const body=document.createElement('div');body.append(paragraph('Scan this code or share the link to invite someone. Anyone with the link can join.'));const canvas=document.createElement('canvas');canvas.className='qr'; body.append(canvas); const link=document.createElement('div');link.className='link-box';link.textContent=`${location.origin}/r/${roomId}`;body.append(link);body.append(button('Copy invite link','dialog-primary',()=>navigator.clipboard.writeText(link.textContent).then(()=>toast('Invite link copied')).catch(()=>toast('Could not copy link'))));body.append(paragraph('Using a room PIN? Share it separately, and ask everyone to enter the same PIN in room options.'));dialog('Invite to this room',body);try{await QRCode.toCanvas(canvas,link.textContent,{width:220,margin:1,color:{dark:'#183c30',light:'#ffffff'}});}catch{toast('Could not make QR code');} }
 $('#invite').onclick=invite;$('#welcome-invite').onclick=invite;
+$('#people-open').onclick=showPeople;
 function editProfile() {const body=document.createElement('div');body.append(paragraph('Pick a name that people in your room will recognize.'));const label=document.createElement('label');label.textContent='Display name';const input=document.createElement('input');input.type='text';input.maxLength=40;input.value=name;label.append(input);body.append(label);const colorsLabel=document.createElement('label');colorsLabel.textContent='Avatar color';const choices=document.createElement('div');for(const c of colors){const b=button('●','icon-button',()=>{color=c;});b.style.color=c;b.setAttribute('aria-label',`Choose ${c}`);choices.append(b);}body.append(colorsLabel,choices,button('Save profile','dialog-primary',()=>{name=input.value.trim().slice(0,40)||name;localStorage.setItem('cbw-name',name);localStorage.setItem('cbw-color',color);profile();broadcast({t:'hello',name,color});$('#dialog').close();}));dialog('Your profile',body);}
 $('#profile-open').onclick=editProfile;
 function options() {const body=document.createElement('div');body.append(button('Edit display name','dialog-secondary',editProfile),button('Create private room','dialog-secondary',makePrivate));if(roomId)body.append(button('Go to network room','dialog-secondary',()=>location.href='/'));const originalLabel=document.createElement('label');originalLabel.className='setting-row';const check=document.createElement('input');check.type='checkbox';check.checked=original;check.onchange=()=>{original=check.checked;localStorage.setItem('cbw-original',String(original));};originalLabel.append(check,document.createTextNode('Send images in original quality'));body.append(originalLabel);if(roomId){const label=document.createElement('label');label.textContent='Room PIN (optional)';const input=document.createElement('input');input.type='password';input.autocomplete='off';input.maxLength=128;input.placeholder='Enter the same PIN on every device';label.append(input);body.append(label,paragraph(sessionStorage.getItem(`cbw-pin:${roomId}`)?'A PIN is set for this tab. Enter a new PIN or leave blank to remove it.':'A PIN encrypts negotiation and messages. It is not included in the invite link. Use a strong secret and share it separately.'));body.append(button('Apply PIN & reconnect','dialog-primary',()=>{if(input.value)sessionStorage.setItem(`cbw-pin:${roomId}`,input.value);else sessionStorage.removeItem(`cbw-pin:${roomId}`);location.reload();}));}body.append(button('Clear chat','dialog-secondary',()=>{if(confirm('Clear the chat in this tab?')){for(const el of messages.values())el.remove();messages.clear();document.querySelectorAll('.system-message').forEach(e=>e.remove());$('#welcome').hidden=false;$('#dialog').close();}}));body.append(paragraph('Messages are delivered only while both devices are online. Nothing is stored on any server.'));dialog('Room options',body);}
