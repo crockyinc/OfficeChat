@@ -1,0 +1,48 @@
+# ChatByWiFi app and signaling Worker.
+#
+# Deliberately NO database or object-storage bindings:
+# no D1, no R2, no KV, no Queues. The Durable Object below is only a
+# live meeting point — it holds room membership in memory and forgets
+# everything when a room empties or the isolate restarts.
+
+# wrangler.toml
+name = 'chat'
+main = "worker/src/index.js"
+compatibility_date = "2025-01-01"
+
+# Build the public app shell before every deploy (including Git builds).
+[build]
+command = "npm run build"
+
+# Static application files only; never user messages, images, or profiles.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/signal", "/config", "/health"]
+
+[observability]
+enabled = true
+
+[durable_objects]
+bindings = [
+  { name = "SIGNALING", class_name = "SignalingRoom" },
+]
+
+# Required by Cloudflare for any Durable Object class, even though this
+# class never calls state.storage. It is a routing/migration tag only.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalingRoom"]
+
+# Optional TURN server (used only when direct P2P fails; relays
+# DTLS-encrypted traffic only, so it cannot read messages).
+# Set these in `wrangler secret put` / dashboard, not in git:
+#   TURN_URLS      e.g. "turn:turn.example.com:3478"
+#   TURN_USERNAME  short-lived or static username
+#   TURN_CREDENTIAL password / credential
+# [vars]
+# TURN_URLS = "turn:turn.example.com:3478"
+
+# Uncomment and set your zone to deploy on a custom domain:
+# routes = [{ pattern = "signal.example.com", custom_domain = true }]

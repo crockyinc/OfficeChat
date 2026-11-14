@@ -1,0 +1,7 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { chunkBuffer, reassembleChunks, ImageReceiver, validateImage, CHUNK_SIZE, MAX_IMAGE_BYTES } from '../frontend/js/images.js';
+import { derivePinKey, seal, unseal } from '../frontend/js/crypto.js';
+test('five megabytes chunk and reassemble without loss',()=>{const bytes=new Uint8Array(5*1024*1024+17);for(let i=0;i<bytes.length;i++)bytes[i]=i%251;const chunks=chunkBuffer(bytes.buffer);assert.equal(chunks[0].length,CHUNK_SIZE);assert.deepEqual(reassembleChunks(chunks,bytes.length),bytes);const receiver=new ImageReceiver();receiver.start('x',bytes.length);chunks.forEach((c,i)=>receiver.addChunk('x',i,c));assert.equal(receiver.progress('x').received,bytes.length);assert.deepEqual(receiver.finish('x'),bytes);});
+test('image validation rejects unsupported and oversized files',()=>{assert.equal(validateImage({type:'image/svg+xml',size:1}).ok,false);assert.equal(validateImage({type:'image/png',size:MAX_IMAGE_BYTES+1}).ok,false);assert.equal(validateImage({type:'image/jpeg',size:42}).ok,true);});
+test('PIN encrypted payloads reject incorrect key and plaintext downgrade',async()=>{const a=await derivePinKey('good','room');const b=await derivePinKey('wrong','room');const wire=await seal(a,{t:'text',text:'hello'});assert.deepEqual(await unseal(a,wire),{t:'text',text:'hello'});await assert.rejects(unseal(b,wire));await assert.rejects(unseal(a,{t:'text',text:'plaintext'}));});
